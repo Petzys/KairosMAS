@@ -1,0 +1,78 @@
+#!/bin/sh
+#
+# Guest init  (M1)
+# ================
+# Direct kernel init (init=/init). Brings up the base mounts and the guest
+# network, then runs the PTY<->vsock bridge that connects the operator's host
+# terminal to Claude Code running inside the VM.
+#
+# The bridge is restarted in a loop: when the operator detaches (closing the
+# host end), the VM stays alive so they can re-attach without a full reboot.
+
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+echo "[init] Kairos guest starting..."
+
+# ---- essential mounts ----
+mount -t proc  proc  /proc              2>/dev/null
+mount -t sysfs sys   /sys               2>/dev/null
+mount -t devtmpfs dev /dev              2>/dev/null
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts         2>/dev/null
+mount -t tmpfs tmpfs /tmp               2>/dev/null
+
+hostname agent-sandbox
+
+# ---- monitored working dir over virtio-fs (M2 filesystem channel) ----
+# Attached by the host only when virtiofsd is running (tag=kairosfs). Everything
+# the agent does under /data flows through the host FUSE monitor + overlay.
+if grep -q virtiofs /proc/filesystems 2>/dev/null; then
+    mkdir -p /data
+    if mount -t virtiofs kairosfs /data 2>/dev/null; then
+        echo "[init] /data mounted (virtiofs — monitored filesystem channel)"
+    fi
+    # monitored /tmp channel (tag=kairostmp), attached by the host only when the
+    # tmp stack is up. Shadows the tmpfs above so scratch scripts are captured.
+    # If not attached, the mount fails and /tmp stays tmpfs.
+    if mount -t virtiofs kairostmp /tmp 2>/dev/null; then
+        chmod 1777 /tmp 2>/dev/null || true
+        echo "[init] /tmp mounted (virtiofs — monitored scratch channel)"
+    fi
+fi
+
+# ---- guest network: static IP behind the host bridge/NAT ----
+ip link set lo up
+ip addr add 192.168.100.2/24 dev eth0 2>/dev/null
+ip link set eth0 up
+ip route add default via 192.168.100.1 2>/dev/null
+# /etc/resolv.conf is baked to point at the host resolver (192.168.100.1)
+
+# ---- TLS trust: system CA bundle carries the proxy CA (used from M4 on) ----
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
+echo "[init] network up (eth0=192.168.100.2, gw=192.168.100.1)"
+
+# ---- pick the bridge command, in priority order:
+#   1. kernel-cmdline override kairos.bridge_cmd=PATH (single token, no spaces —
+#      /proc/cmdline is split on whitespace here; used for smoke payloads)
+#   2. /etc/kairos/bridge_cmd (full command line WITH flags, baked at build time —
+#      this is where --dangerously-skip-permissions / --model live)
+#   3. bare `claude`
+for tok in $(cat /proc/cmdline 2>/dev/null); do
+    case "$tok" in
+        kairos.bridge_cmd=*) BRIDGE_CMD="${tok#kairos.bridge_cmd=}" ;;
+    esac
+done
+if [ -z "$BRIDGE_CMD" ] && [ -f /etc/kairos/bridge_cmd ]; then
+    BRIDGE_CMD="$(cat /etc/kairos/bridge_cmd)"
+fi
+export BRIDGE_CMD="${BRIDGE_CMD:-claude}"
+echo "[init] launching PTY<->vsock bridge (cmd=${BRIDGE_CMD})"
+
+# ---- run the bridge, restart on detach ----
+while true; do
+    BRIDGE_CMD="${BRIDGE_CMD}" python3 /opt/bridge/pty_vsock_bridge.py
+    echo "[init] bridge exited; re-arming in 2s"
+    sleep 2
+done

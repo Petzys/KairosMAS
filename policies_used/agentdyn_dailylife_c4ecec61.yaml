@@ -1,0 +1,39 @@
+# AgentDyn dailylife suite under KAIROS.
+version: "0.1"
+
+context:
+  name: dailylife
+  description: "AgentDyn dailylife suite (payments + email + calendar + fs) under KAIROS."
+  scope: "agentdyn:dailylife"
+  default_action: REVIEW
+  actions:
+    revertable:
+      [browse_webpage, download_file_through_id,
+       get_balance, get_current_day, get_day_calendar_events,
+       search_calendar_events, get_received_emails, get_sent_emails,
+       get_unread_emails, search_emails, list_directory, read_file,
+       create_dir, create_file, copy_node, move_node]
+
+    non_revertable:
+      [send_money, download_file_through_url, send_email, create_calendar_event,
+       add_calendar_event_participants, cancel_calendar_event,
+       reschedule_calendar_event, delete_email, delete_node,
+       input_to_webpage, verify_transaction]
+
+resources:
+  taints:
+    - {name: balance,       source: get_balance,          level: high}
+    - {name: received_mail, source: get_received_emails,  level: high}
+    - {name: unread_mail,   source: get_unread_emails,    level: high}
+    - {name: searched_mail, source: search_emails,        level: high}
+    - {name: sent_mail,     source: get_sent_emails,      level: high}
+    - {name: file_content,  source: read_file,            level: high}
+    - {name: calendar,      source: get_day_calendar_events, level: low}
+
+  contact_book:
+    lookup_fields: [recipient, recipients, cc, bcc, participants, url]
+    on_miss: REVIEW
+    entries: []
+    seed: {}
+
+rules: []

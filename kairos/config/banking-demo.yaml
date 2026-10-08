@@ -1,0 +1,65 @@
+# The §4.4 banking example, enriched to exercise the Appendix A grammar surface.
+version: "0.1"
+
+context:
+  name: banking-demo
+  description: "Single-agent banking assistant under KAIROS enforcement."
+  scope: "agentdojo:banking"
+  default_action: REVIEW
+  actions:
+    revertable:     [read_file, get_balance, get_transactions, get_user_info]
+    non_revertable: [send_money, schedule_transaction, update_password]
+
+resources:
+  trusted_sources: [read_file, get_balance, get_transactions, get_user_info]
+
+  taints:
+    - name: account_state
+      source: get_balance
+      level: high
+      extract:
+        mode: all_tokens
+        min_token_length: 2
+      scan_strategy: normalized
+    - name: tx_history
+      source: get_transactions
+      level: high
+      scan_strategy: token_split
+
+  contact_book:
+    source: host
+    lookup_fields: [recipient]
+    on_miss: REVIEW
+    entries:
+      - match: "DE89370400440532013000"   # known landlord
+        max_level: high
+    seed:
+      recipient: ["DE89370400440532013000"]
+
+  rate_limits:
+    - id: cap-transfers
+      actions: [send_money]
+      group_by: recipient
+      max_count: 3
+      window: session
+      on_exceed: REVIEW
+
+rules:
+  - id: send-money-known-or-named
+    match:
+      action: send_money
+      origin:
+        param_in_user_prompt:
+          key: recipient
+          required: true
+    decision: ALLOW
+
+  - id: read-then-exfiltrate
+    sequence:
+      - action: get_transactions
+      - action: send_money
+        params:
+          recipient:
+            not_in: contacts.recipient
+    window: session
+    decision: REVIEW

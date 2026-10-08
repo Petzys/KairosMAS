@@ -1,0 +1,232 @@
+--- a/agentdojo/src/agentdojo/agent_pipeline/agent_pipeline.py
++++ b/agentdojo/src/agentdojo/agent_pipeline/agent_pipeline.py
+@@ -54,6 +54,7 @@
+     "progent",
+     "camel",
+     "camel_nopolicy",
++    "kairos",
+ ]
+ """Available defenses."""
+ 
+@@ -152,16 +153,39 @@
+         if not api_key:
+             raise ValueError("GEMINI_API_KEY environment variable is required for native Gemini targets")
+         llm = GoogleLLM(model, genai.Client(api_key=api_key))
++    elif "/" in model and os.getenv("OPENROUTER_API_KEY"):
++        # A VENDOR-PREFIXED id ("openai/gpt-4o-mini", "google/gemini-...",
++        # "meta-llama/...") is an OpenRouter id, so route it there. Deciding on the
++        # id FORM rather than on which key happens to be set is what lets both keys
++        # coexist: the AutoDojo optimizer needs OPENROUTER_API_KEY for its own LLM
++        # while the target agent is billed to OpenAI. Previously any OpenRouter key
++        # captured every model, silently sending a bare "gpt-4o-mini" to OpenRouter.
++        client = openai.OpenAI(
++            api_key=os.getenv("OPENROUTER_API_KEY"),
++            base_url="https://openrouter.ai/api/v1",
++        )
++        llm = OpenAILLM(client, model)
++    elif "/" not in model and os.getenv("OPENAI_API_KEY"):
++        # A BARE id ("gpt-4o-mini-2024-07-18") is an OpenAI model id → OpenAI direct.
++        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
++        llm = OpenAILLM(client, model)
++    elif os.getenv("OPENROUTER_API_KEY"):
++        # Fallback: bare id but no OpenAI key — keep the old OpenRouter behaviour.
++        client = openai.OpenAI(
++            api_key=os.getenv("OPENROUTER_API_KEY"),
++            base_url="https://openrouter.ai/api/v1",
++        )
++        llm = OpenAILLM(client, model)
++    elif os.getenv("OPENAI_API_KEY"):
++        # Fallback: vendor-prefixed id but only an OpenAI key — strip "openai/".
++        direct_model = model[len("openai/"):] if model.startswith("openai/") else model
++        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
++        llm = OpenAILLM(client, direct_model)
+     else:
+-        # All other models go through OpenRouter
+-        api_key = os.getenv("OPENROUTER_API_KEY")
+-        if not api_key:
+-            raise ValueError("OPENROUTER_API_KEY environment variable is required for non-vLLM models")
+-        client = openai.OpenAI(
+-            api_key=api_key,
+-            base_url="https://openrouter.ai/api/v1",
+-        )
+-        llm = OpenAILLM(client, model)
++        raise ValueError(
++            "set OPENAI_API_KEY (talk to OpenAI directly) or OPENROUTER_API_KEY "
++            "(route through OpenRouter) for non-vLLM models"
++        )
+     return llm
+ 
+ 
+@@ -299,6 +323,14 @@
+             if not isinstance(config.llm, str):
+                 raise ValueError(f"'{config.defense}' defense requires a named model (config.llm as str).")
+             return cls._build_camel_pipeline(config)
++
++        # KAIROS (this paper's reference monitor) is a full transactional gate on
++        # tool execution, not a filter element — it builds its own tools loop. All
++        # KAIROS knowledge lives in the kairos package (policy map, judge, mode);
++        # this is a thin registration hook. Per-suite policy via config.suite_name.
++        if config.defense == "kairos":
++            from kairos.adapters.autodojo import build_kairos_pipeline
++            return build_kairos_pipeline(cls, config)
+ 
+         llm = (
+             get_llm(config.llm)
+@@ -613,7 +645,7 @@
+ 
+         if llm_name.lower() in ("vllm_parsed", "local") or llm_name.startswith("Qwen/"):
+             provider, model_name = "openai", (config.model_id or llm_name)
+-        elif llm_name.startswith(("openai/", "google/", "anthropic/", "meta-llama/", "qwen/")):
++        elif llm_name.startswith(("openai/", "google/", "anthropic/", "meta-llama/", "qwen/", "deepseek/")):
+             # An OpenRouter id ("<vendor>/<model>"), the form every other API-model baseline in this
+             # fork is run with. OpenRouter is OpenAI-compatible, so BOTH CaMeL LLMs go through the
+             # openai SDK regardless of the vendor: point OPENAI_BASE_URL at OpenRouter with
+--- a/agentdojo/src/agentdojo/agent_pipeline/llms/openai_llm.py
++++ b/agentdojo/src/agentdojo/agent_pipeline/llms/openai_llm.py
+@@ -176,12 +176,28 @@
+ 
+ 
+ def _openai_to_tool_call(tool_call: ChatCompletionMessageToolCall) -> FunctionCall:
+-    args = json.loads(tool_call.function.arguments)
++    # Llama 3.3 via OpenRouter occasionally emits a tool call whose `arguments` is the JSON
++    # value `null` (or is missing). json.loads then yields None, which FunctionCall rejects
++    # (`args` must be a dict) and the whole benchmark process would die. Treat it as a call
++    # WITHOUT arguments: the tool runtime reports the missing parameters back to the model,
++    # exactly as it does for any other malformed call. Only reachable where the run used to crash.
++    raw_args = tool_call.function.arguments
++    args = json.loads(raw_args) if raw_args is not None else None
++    if args is None:
++        args = {}
+     # Some providers (deepseek via OpenRouter) double-encode the arguments as a
+     # JSON string, so one decode yields a str rather than the args dict. Decode
+     # the inner payload once more in that case.
+     if isinstance(args, str):
+         args = json.loads(args)
++    # Some models (Llama 3.3 via OpenRouter) emit args as a list of single-key
++    # objects instead of one object; merge them into the dict FunctionCall wants.
++    if isinstance(args, list):
++        merged: dict = {}
++        for part in args:
++            if isinstance(part, dict):
++                merged.update(part)
++        args = merged
+     return FunctionCall(
+         function=tool_call.function.name,
+         args=args,
+--- a/agentdojo/src/agentdojo/benchmark.py
++++ b/agentdojo/src/agentdojo/benchmark.py
+@@ -133,6 +133,18 @@
+                         or "reduce the length of the messages." in repr(e)
+                         or "reduce the length of the input messages." in repr(e)
+                         or "max_tokens must be at least" in repr(e)
++                        # OpenRouter providers (AkashML, DeepInfra) phrase the same overflow as
++                        # "This model's maximum context length is 131072 tokens. However, you
++                        # requested N output tokens and your prompt contains at least M input
++                        # tokens". Seen on Llama-3.3-70B (128k ctx) in the workspace suite with
++                        # ~90k-token prompts. Without this the cell died instead of scoring the
++                        # task as failed like every other context overflow.
++                        # ...and a third provider says "exceeds this model's maximum context
++                        # length of 262144 tokens" (Qwen3.6 via OpenRouter, CaMeL cells). Match
++                        # the common substring rather than chasing each provider's grammar.
++                        or "maximum context length" in repr(e)
++                        or "exceeds this model" in repr(e)
++                        or "context window" in repr(e)
+                     ):
+                         logger.log_error(
+                             f"Skipping task '{user_task.ID}' with '{injection_task.ID}' due to context_length_exceeded: {e}"
+--- a/agentdojo/src/agentdojo/default_suites/v1/slack/user_tasks.py
++++ b/agentdojo/src/agentdojo/default_suites/v1/slack/user_tasks.py
+@@ -159,7 +159,7 @@
+         if self.COMPANY_URL not in post_environment.web.web_requests:
+             return False
+         for hobby in ["hiking", "swimming", "painting"]:
+-            if hobby not in post_environment.web.web_content[self.COMPANY_URL]:
++            if hobby not in post_environment.web.web_content.get(self.COMPANY_URL, ""):
+                 return False
+         return True
+ 
+--- a/agentdojo/src/agentdojo/defenses/camel/src/camel/interpreter/interpreter.py
++++ b/agentdojo/src/agentdojo/defenses/camel/src/camel/interpreter/interpreter.py
+@@ -1666,7 +1666,16 @@
+                     tool_calls_chain,
+                     dependencies,
+                 )
+-            r = in_not_in(node.ops[0], left, right)
++            # `None in "abc"` raises TypeError inside CaMeLStr.contains. That is an ordinary mistake
++            # in model-generated code, exactly like the `cmp` branch above, so hand it back to the
++            # privileged LLM as an interpreter error instead of letting it escape and kill the
++            # whole suite (seen: Llama-3.3-70B, travel, task 90/140).
++            try:
++                r = in_not_in(node.ops[0], left, right)
++            except (TypeError, AttributeError) as e:
++                return EvalResult(
++                    result.Error(CaMeLException(e, (node,), (left, right))), namespace, tool_calls_chain, dependencies
++                )
+         case _:
+             raise NotImplementedError(f"Comparison operator {node.ops[0]} not supported.")
+     return EvalResult(result.Ok(r), namespace, tool_calls_chain, dependencies)
+@@ -2025,8 +2034,16 @@
+         case result.Ok(v):
+             evaled_args = v
+ 
+-    # If this is a method, place the receiver as first argument
+-    if evaled_fn.receiver() is not None:
++    # If this is a method, place the receiver as first argument.
++    # Guard on CaMeLCallable: `.receiver()` only exists on callables, and the
++    # "is it callable?" check below (line ~2042) is deliberately deferred until
++    # after args are evaluated (Python semantics). Without this guard, code that
++    # calls a non-callable (e.g. the int returned by query_ai_assistant) crashes
++    # here with AttributeError and aborts the whole run, instead of falling
++    # through to the TypeError('... is not callable') that CaMeL already raises
++    # and feeds back to the model as a retry. Robustness fix only — no security
++    # behaviour changes (matches the fork's other vendored-interpreter crash fixes).
++    if isinstance(evaled_fn, value.CaMeLCallable) and evaled_fn.receiver() is not None:
+         evaled_args = evaled_args.new_with_python_value((evaled_fn.receiver(), *evaled_args._python_value))
+ 
+     evaled_kwargs_res, namespace, tool_calls_chain, dependencies = _eval_keywords(
+--- a/agentdojo/src/agentdojo/models.py
++++ b/agentdojo/src/agentdojo/models.py
+@@ -92,6 +92,19 @@
+ 
+ 
+ MODEL_NAMES = {
++    # Paper additions, FIRST so they win the substring match over generic keys
++    # ("transformers" -> "Local model" would otherwise capture the PI-detector
++    # pipeline name). Both id forms are listed: the fork's defenses name pipelines
++    # "<id>/<defense>" (slash kept) while CaMeL names them "<id with / -> _>/camel".
++    # Values follow upstream's convention: family name, and its own Llama entry maps
++    # to the generic "AI assistant". These are the same values scripts/run_benchmark.py
++    # uses under --agent-name-map correct, so both harnesses address a model alike.
++    "meta-llama/llama-3.3-70b-instruct": "AI assistant",
++    "meta-llama_llama-3.3-70b-instruct": "AI assistant",
++    "qwen/qwen3.6-35b-a3b": "Qwen",
++    "qwen_qwen3.6-35b-a3b": "Qwen",
++    "deepseek/deepseek-v4-flash-0731": "DeepSeek",
++    "deepseek_deepseek-v4-flash-0731": "DeepSeek",
+     "gpt-4o-2024-05-13": "GPT-4",
+     "gpt-4o-mini-2024-07-18": "GPT-4",
+     "gpt-3.5-turbo-0125": "GPT-3.5",
+--- a/agentdojo/src/agentdojo/types.py
++++ b/agentdojo/src/agentdojo/types.py
+@@ -107,6 +107,19 @@
+     return converted
+ 
+ 
+-def get_text_content_as_str(content_blocks: list[MessageContentBlock]) -> str:
+-    non_empty_content = [c["content"] for c in content_blocks if c["content"] is not None]
++def get_text_content_as_str(content_blocks: list[MessageContentBlock] | None) -> str:
++    """Flatten content blocks to text, tolerating a null `content`.
++
++    `model_output_from_messages` is declared `-> list[MessageContentBlock] | None`
++    and _check_task_result passes its result here unguarded, so a model whose final
++    assistant message carries `content: null` -- which several OpenRouter-served
++    models do when the turn ends on a tool call -- crashed the run with
++    "'NoneType' object is not iterable". An absent message is empty text, which is
++    what every caller already means by it; models that always emit content are
++    unaffected, so scoring does not change for them.
++    """
++    if not content_blocks:
++        return ""
++    non_empty_content = [c["content"] for c in content_blocks
++                         if c is not None and c.get("content") is not None]
+     return "\n".join(non_empty_content)

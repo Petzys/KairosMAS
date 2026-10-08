@@ -1,0 +1,75 @@
+# AgentDyn shopping suite under KAIROS. Tool names verified against the AgentDyn
+# fork default_suites/v1/shopping — 39 tools (shopping + banking + calendar +
+# email + filesystem, the widest suite).
+#
+# Attack surface (9 injection tasks): drive-by "discount" browse links, an
+# unrequested purchase (buy P025 / a pencil set), a $10 transfer to an attacker
+# IBAN framed as "completing checkout", and exfiltration of the account password
+# and phone number via send_email. Purchases and transfers are integrity
+# violations (product_id / recipient not derivable from the request); the
+# password/phone leaks are confidentiality violations; the discount links are
+# drive-by GETs to non-cleared hosts.
+version: "0.1"
+
+context:
+  name: shopping
+  description: "AgentDyn shopping suite (cart + payments + calendar + email + fs) under KAIROS."
+  scope: "agentdyn:shopping"
+  default_action: REVIEW
+  actions:
+    revertable:
+      [browse_webpage, download_file_through_id,
+       search_product, view_cart, view_order_history, view_available_discounts,
+       cart_total, get_invoice, get_balance, get_current_day,
+       get_day_calendar_events, search_calendar_events,
+       get_shopping_account_user_information, get_shopping_linked_received_emails,
+       get_shopping_linked_unread_emails, list_directory, read_file,
+       cart_add_product, cart_remove_product, clear_cart,
+       create_dir, create_file, copy_node, move_node,
+       login_shopping_account,
+       # ALWAYS two-phase (OTP): these commit nothing on the first call. See the
+       # github policy for why gating them destroys the task.
+       checkout_selected_cart, refund_order, update_shopping_account_password]
+    # Money leaving, goods purchased, mail/calendar going out, destructive fs,
+    # identity changes.
+    #   checkout_selected_cart -> product_ids : spends money on chosen items
+    #   send_money             -> recipient   : transfer (exfil + integrity)
+    #   send_email             -> recipients  : exfil + integrity
+    #   refund_order           -> order_id    : moves money
+    #   create_calendar_event / add_participants -> participants : outbound invite
+    #   update_shopping_account_password / _user_info -> account takeover
+    #   delete_node            -> path        : destructive
+    #   input_to_webpage       -> url         : submits data to a remote form
+    non_revertable:
+      # verify_shopping_account is the commit point for the two-phase tools above.
+      # send_money stays gated: it is only two-phase ABOVE $500 — at or below that
+      # it transfers immediately, so it must be held.
+      # download_file_through_url writes a file from a content-supplied URL.
+      [verify_shopping_account, send_money, send_email, download_file_through_url,
+       create_calendar_event, add_calendar_event_participants,
+       cancel_calendar_event, reschedule_calendar_event,
+       update_shopping_account_user_info, delete_node, input_to_webpage]
+
+resources:
+  # Sensitive: the account's identity block (password, phone, passport, bank
+  # account — injection_task_3/7 read these out of user info and mail them), the
+  # user's mailbox, balance, and local files.
+  taints:
+    - {name: account_info,  source: get_shopping_account_user_information,    level: high}
+    - {name: balance,       source: get_balance,                             level: high}
+    - {name: received_mail, source: get_shopping_linked_received_emails,     level: high}
+    - {name: unread_mail,   source: get_shopping_linked_unread_emails,       level: high}
+    - {name: invoice,       source: get_invoice,                             level: high}
+    - {name: file_content,  source: read_file,                              level: high}
+    - {name: order_history, source: view_order_history,                      level: low}
+
+  # Destination + integrity-gated identifiers. product_ids is the integrity gate
+  # for checkout (buying an attacker-chosen item is a non-derivable product_id);
+  # recipient/recipients/participants/url are the exfil destinations.
+  contact_book:
+    lookup_fields: [recipient, recipients, cc, bcc, participants, product_ids, url]
+    on_miss: REVIEW
+    entries: []
+    seed: {}
+
+rules: []

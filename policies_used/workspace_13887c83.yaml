@@ -1,0 +1,36 @@
+# AgentDojo workspace suite (v1) under KAIROS. 
+version: "0.1"
+
+context:
+  name: workspace
+  description: "AgentDojo workspace suite (email + calendar + cloud drive) under KAIROS."
+  scope: "agentdojo:workspace"
+  default_action: REVIEW
+  actions:
+    revertable:
+      [get_unread_emails, get_sent_emails, get_received_emails, get_draft_emails,
+       search_emails, search_contacts_by_name, search_contacts_by_email,
+       get_current_day, search_calendar_events, get_day_calendar_events,
+       list_files, search_files, search_files_by_filename, get_file_by_id,
+       append_to_file, create_file]
+    non_revertable:
+      [send_email, share_file, create_calendar_event, add_calendar_event_participants,
+       delete_email, delete_file, cancel_calendar_event, reschedule_calendar_event]
+
+resources:
+  taints:
+    - {name: received_email, source: get_received_emails, level: high}
+    - {name: unread_email,   source: get_unread_emails,   level: high}
+    - {name: searched_email, source: search_emails,       level: high}
+    - {name: file_content,   source: get_file_by_id,      level: high}
+    - {name: file_search,    source: search_files,        level: high}
+    - {name: calendar,       source: get_day_calendar_events, level: high}
+    - {name: contacts,       source: search_contacts_by_name, level: low}
+
+  contact_book:
+    lookup_fields: [recipients, cc, bcc, email, participants]
+    on_miss: REVIEW
+    entries: []
+    seed: {}
+
+rules: []

@@ -1,0 +1,39 @@
+# AgentDojo banking suite (v1) under KAIROS. Tool names verified against
+# agentdojo 0.1.35 default_suites/v1/banking.
+version: "0.1"
+
+context:
+  name: banking
+  description: "AgentDojo banking suite under KAIROS enforcement."
+  scope: "agentdojo:banking"
+  default_action: REVIEW
+
+  actions:
+    revertable:
+      [get_iban, get_balance, get_most_recent_transactions,
+       get_scheduled_transactions, read_file, get_user_info]
+    non_revertable:
+      [send_money, schedule_transaction, update_scheduled_transaction,
+       update_password, update_user_info]
+
+resources:
+  taints:
+    - {name: balance,    source: get_balance,                 level: high}
+    - {name: iban,       source: get_iban,                    level: high}
+    - {name: user_info,  source: get_user_info,               level: high}
+    - {name: tx_history, source: get_most_recent_transactions, level: high}
+    - {name: scheduled,  source: get_scheduled_transactions,  level: high}
+
+  contact_book:
+    lookup_fields: [recipient]
+    on_miss: REVIEW
+    entries: []
+    seed: {}
+
+rules:
+  - id: review-send-with-sensitive-payload
+    match:
+      action: [send_money, schedule_transaction, update_scheduled_transaction]
+      taint:
+        level_gte: high
+    decision: REVIEW

@@ -1,0 +1,24 @@
+--- a/src/agentdojo/types.py
++++ b/src/agentdojo/types.py
+@@ -87,6 +87,19 @@
+ """Union type of possible messages in the chat. These are very similar types currently supported by the OpenAI API."""
+ 
+ 
+-def get_text_content_as_str(content_blocks: list[MessageContentBlock]) -> str:
+-    non_empty_content = [c["content"] for c in content_blocks if c["content"] is not None]
++def get_text_content_as_str(content_blocks: list[MessageContentBlock] | None) -> str:
++    """Flatten content blocks to text, tolerating a null `content`.
++
++    `model_output_from_messages` is declared `-> list[MessageContentBlock] | None`
++    and _check_task_result passes its result here unguarded, so a model whose final
++    assistant message carries `content: null` -- which several OpenRouter-served
++    models do when the turn ends on a tool call -- crashed the run with
++    "'NoneType' object is not iterable". An absent message is empty text, which is
++    what every caller already means by it; models that always emit content are
++    unaffected, so scoring does not change for them.
++    """
++    if not content_blocks:
++        return ""
++    non_empty_content = [c["content"] for c in content_blocks
++                         if c is not None and c.get("content") is not None]
+     return "\n".join(non_empty_content)

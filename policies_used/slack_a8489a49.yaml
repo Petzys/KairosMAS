@@ -1,0 +1,56 @@
+# AgentDojo slack suite (v1) under KAIROS. Tool names verified against
+# agentdojo 0.1.35 default_suites/v1/slack (TOOLS list in slack/task_suite.py).
+version: "0.1"
+
+context:
+  name: slack
+  description: "AgentDojo slack suite under KAIROS enforcement."
+  scope: "agentdojo:slack"
+  default_action: REVIEW
+  navigational_get: review
+
+  embedded_identifiers: review
+
+  actions:
+    revertable:
+      [get_channels, get_users_in_channel, read_channel_messages,
+       read_inbox, get_webpage]
+    non_revertable:
+      [send_direct_message, send_channel_message, post_webpage,
+       add_user_to_channel, invite_user_to_slack, remove_user_from_slack]
+
+resources:
+  taints:
+    - {name: channel_msgs, source: read_channel_messages, level: high}
+    - {name: inbox,        source: read_inbox,            level: high}
+    - {name: webpage,      source: get_webpage,           level: high}
+    - {name: channel_list, source: get_channels,          level: low}
+    - {name: user_list,    source: get_users_in_channel,  level: low}
+
+  contact_book:
+    lookup_fields: [recipient, channel, url, user, user_email]
+    on_miss: REVIEW
+    entries: []
+    seed: {}
+
+rules:
+  - id: review-untrusted-get
+    match:
+      action: get_webpage
+      origin:
+        param_in_user_prompt:
+          key: url
+          required: false   # match when url is NOT derivable from the user prompt
+    decision: REVIEW
+  - id: review-link-in-message
+    match:
+      action: [send_direct_message, send_channel_message]
+      params:
+        body: {contains: "www."}
+    decision: REVIEW
+  - id: review-outbound-with-sensitive-payload
+    match:
+      action: [send_direct_message, send_channel_message, post_webpage]
+      taint:
+        level_gte: high
+    decision: REVIEW

@@ -1,0 +1,42 @@
+# AgentDyn github suite under KAIROS.
+version: "0.1"
+
+context:
+  name: github
+  description: "AgentDyn github suite (repos + SSH keys + email + filesystem) under KAIROS."
+  scope: "agentdyn:github"
+  default_action: REVIEW
+  actions:
+    revertable:
+      [browse_webpage, download_file_through_id,
+       get_github_account_user_information, get_github_linked_unread_emails,
+       get_github_repository_information, get_logged_in_github_user_information,
+       get_received_emails, get_sent_emails, git_get_linked_ssh_keys,
+       list_directory, read_file, git_clone, git_pull,
+       git_create_repo, create_dir, create_file, copy_node, move_node,
+       login_github_account,
+       update_github_account_password, git_delete_repo, git_transfer_repo_ownership,
+       git_invite_collaborators, git_add_ssh_key, git_delete_ssh_key]
+    non_revertable:
+      [send_email, verify_github_account, download_file_through_url,
+       git_star, git_unstar, delete_node, git_issue, git_push, input_to_webpage]
+
+resources:
+  taints:
+    - {name: ssh_keys,     source: git_get_linked_ssh_keys,             level: high}
+    - {name: file_content, source: read_file,                           level: high}
+    - {name: account_info, source: get_logged_in_github_user_information, level: high}
+    - {name: other_info,   source: get_github_account_user_information,  level: high}
+    - {name: received_mail,source: get_received_emails,                  level: high}
+    - {name: unread_mail,  source: get_github_linked_unread_emails,      level: high}
+    - {name: sent_mail,    source: get_sent_emails,                      level: high}
+    - {name: repo_info,    source: get_github_repository_information,     level: low}
+
+  contact_book:
+    lookup_fields: [recipients, cc, bcc, collaborator_email, new_owner_email,
+                    new_owner_username, url]
+    on_miss: REVIEW
+    entries: []
+    seed: {}
+
+rules: []
