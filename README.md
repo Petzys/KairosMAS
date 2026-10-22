@@ -13,6 +13,8 @@ remaining sections describe how to repeat the runs.
 | Path | What it is |
 |---|---|
 | `kairos/` | The reference monitor: policy engine, provenance tracking, speculative state machine, oracle, and the benchmark and deployment adapters |
+| `kairos/mas/` | Kairos MAS: the multi-agent monitor (A2A, clusters, causal lineage) and the MASDojo benchmark ([design](kairos/mas/README.md)) |
+| `scripts/run_mas_benchmark.py` | Runs MASDojo grids (suites x cluster layouts) with scripted or LLM agents |
 | `deploy/` | The deployed stack: microVM, file channel (OverlayFS, FUSE, write-ahead log), network channel (mitmproxy), control plane, latency benchmarks ([overview](deploy/README.md), [usage](deploy/docs/USAGE.md)) |
 | `scripts/run_benchmark.py` | Runs one AgentDojo or AgentDyn suite with or without Kairos |
 | `evaluation/` | Driver scripts for every reported run set, the AgentDyn policies, and the analysis scripts |
@@ -21,6 +23,24 @@ remaining sections describe how to repeat the runs.
 | `env/` | Exact package versions of the two Python environments the runs used |
 | `tests/` | Unit tests |
 | `runs/`, `runs_models/`, `runs_judge/`, `evaluation/*/runs/`, `autodojo_runs/`, `production_runs/` | Run records, listed in [DATA.md](DATA.md) |
+
+## KAIROS MAS (multi-agent systems)
+
+`kairos/mas/` extends the monitor to systems of opaque agents that communicate over A2A:
+one enforcement point per agent host, one decision point per cluster of agents. Messages
+inside a cluster are logged and never stalled; messages leaving a cluster are released like
+external requests (blocking `SendMessage` decided at once, streaming `SendStreamingMessage`
+held in the sender's speculative scope); every external effect passes full Kairos with labels
+joined across agents and an oracle that sees the effect's lineage. **MASDojo**
+(`kairos/mas/bench/`) evaluates it on the AgentDojo suites lifted to multi-agent systems,
+deterministically and without API keys:
+
+```bash
+.venv/bin/python scripts/run_mas_benchmark.py --suite all --layout one domain singleton
+.venv/bin/python -m pytest tests -k mas
+```
+
+Design, decisions, benchmark and results: [kairos/mas/README.md](kairos/mas/README.md).
 
 ## Verify the reported numbers
 

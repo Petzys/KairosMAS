@@ -228,6 +228,7 @@ class AgentMonitor(ReferenceMonitor):
         with self.lock:
             if self.machine.state is not State.BRANCH or self.machine.active is None:
                 return None
+            self._await_lineage()
             cdec, branch, outcome = ReferenceMonitor.resolve_branch(self, self._dispatch, pending=pending)
             self._after_resolution(trigger, cdec, branch, outcome)
             return cdec, branch, outcome
@@ -273,6 +274,7 @@ class AgentMonitor(ReferenceMonitor):
         """Decide ONE effect now, with no branch: what the agent has done so far is
         the evidence (sync GETs, blocking messages, replies)."""
         with self.lock:
+            self._await_lineage()
             branch = Branch(branch_id=f"sync-{mode}", opened_at=0.0, opened_reason=ev.reason)
             branch.held_calls.append(HeldAction(call_ref=ev.call_ref, tool=ev.tool, args=ev.args,
                                                 provenance=ev.provenance, reason=ev.reason,
@@ -343,8 +345,14 @@ class AgentMonitor(ReferenceMonitor):
             return out
 
     # --- the inter-agent channel: outbound ----------------------------------
+    def _await_lineage(self) -> None:
+        """An effect is decided once all causally preceding events have arrived."""
+        if not self.fabric.await_lineage(self.clock.current):
+            self.attribution["WARN:lineage_incomplete"] += 1
+
     def decide_send(self, record: MessageRecord) -> MessageDecision:
         with self.lock:
+            self._await_lineage()
             spec = self.spec
             record.intra = spec.same_cluster(record.sender, record.receiver)
             stage = self._evaluate(record)

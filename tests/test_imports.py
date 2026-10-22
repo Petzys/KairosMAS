@@ -15,6 +15,12 @@ MODULES = [
     "kairos.judge.oracle", "kairos.judge.commit",
     "kairos.adapters.base", "kairos.adapters.agentdojo.pipeline_elements",
     "kairos.adapters.agentdojo.effector", "kairos.adapters.production",
+    "kairos.mas", "kairos.mas.spec", "kairos.mas.spec_parser", "kairos.mas.causal",
+    "kairos.mas.policy", "kairos.mas.agent", "kairos.mas.fabric", "kairos.mas.enforcement",
+    "kairos.mas.oracle", "kairos.mas.notices", "kairos.mas.transport", "kairos.mas.runtime",
+    "kairos.mas.a2a", "kairos.mas.a2a.protocol", "kairos.mas.a2a.adapter", "kairos.mas.a2a.server",
+    "kairos.mas.a2a.client", "kairos.mas.a2a.http", "kairos.mas.serve",
+    "kairos.mas.bench.suites", "kairos.mas.bench.harness",
 ]
 
 
