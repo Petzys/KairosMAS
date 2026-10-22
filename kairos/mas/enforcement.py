@@ -213,17 +213,6 @@ class EnforcementPoint:
     def drain_notices(self) -> list[str]:
         return self.monitor.drain_notices() if self.defense else []
 
-    def terminal(self) -> bool:
-        """The agent finished a task. Returns True if a resolution withheld
-        something (its notices are queued: drain_notices)."""
-        if not self.defense:
-            return False
-        r = self.monitor.on_terminal()
-        return bool(r is not None and r[2].aborted)
-
-    def drain_notices(self) -> list[str]:
-        return self.monitor.drain_notices() if self.defense else []
-
     # =====================================================================
     # A2A client side: the agent's requests to other agents
     # =====================================================================
