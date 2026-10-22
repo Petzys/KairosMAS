@@ -219,10 +219,14 @@ def ingress_app(ep: Any, path: str = "/a2a") -> Starlette:
                              Route("/.well-known/agent-card.json", card, methods=["GET"])])
 
 
-def egress_app(ep: Any) -> Starlette:
+def egress_app(ep: Any) -> Any:
     """Where the agent's outbound requests land: the enforcement point's client
     side. The target is the absolute request URI (explicit proxy) or Host + path
-    (transparent redirect)."""
+    (transparent redirect).
+
+    An ASGI server hands an absolute-form target ("POST http://peer/a2a") through
+    as the path, which no route matches; the wrapper routes it while the target
+    stays in raw_path."""
 
     def forward(request: HttpRequest) -> Response:
         body = read_body(request)
@@ -235,4 +239,12 @@ def egress_app(ep: Any) -> Starlette:
             return _stream_response(ep.send_stream(target, body), monitor=False)
         return Response(ep.send(target, body), media_type="application/json")
 
-    return Starlette(routes=[Route("/{path:path}", forward, methods=["POST"])])
+    inner = Starlette(routes=[Route("/{path:path}", forward, methods=["POST"])])
+
+    async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and not scope.get("path", "/").startswith("/"):
+            raw = scope.get("raw_path") or scope["path"].encode()
+            scope = {**scope, "path": "/", "raw_path": raw}
+        await inner(scope, receive, send)
+
+    return app

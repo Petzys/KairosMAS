@@ -69,3 +69,33 @@ def test_held_streamed_message_over_sockets() -> None:
     finally:
         for srv in servers:
             srv.should_exit = True
+
+
+def test_egress_as_explicit_proxy() -> None:
+    """An agent whose HTTP client uses its host's egress listener as a proxy sends
+    absolute-form requests; they are monitored like redirected ones."""
+    import httpx
+
+    spec, servers = banking_spec(), []
+    fabric = MonitorFabric(spec, judge_factory=lambda m: ScriptedJudge())
+    fabric.begin_session("hi")
+    ingress: dict[str, str] = {}
+    net = HttpNetwork(resolve=lambda url: ingress[endpoint_origin(url)] + "/a2a", timeout=20)
+    egress = {}
+    try:
+        for a, ag in spec.agents.items():
+            ep = EnforcementPoint(fabric, a, net)
+            app = agent_app(A2AServer(a, ag.endpoint, lambda m, t, a=a: AgentResult(text=f"hello from {a}")))
+            ep.server = HttpAgentServer(_serve(app, servers) + "/a2a")
+            ingress[endpoint_origin(ag.endpoint)] = _serve(ingress_app(ep), servers)
+            egress[a] = _serve(egress_app(ep), servers)
+        proxied = httpx.Client(proxy=egress["assistant"], timeout=20)
+        client = A2AClient(lambda url, body: proxied.post(url, content=body,
+                                                          headers={"content-type": "application/json"}).content,
+                           lambda url, body: None)
+        r = client.send_message(spec.agents["documents"].endpoint, "read the bill")
+        assert r.state is TaskState.COMPLETED and r.text == "hello from documents"
+        assert fabric.report()["counts"]["messages"] == 2           # request and reply, both monitored
+    finally:
+        for srv in servers:
+            srv.should_exit = True
