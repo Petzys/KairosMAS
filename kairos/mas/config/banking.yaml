@@ -1,0 +1,95 @@
+# A multi-agent banking assistant under KAIROS MAS (AgentDojo banking tools, split
+# across specialised agents). Hand-written example of a system specification; the
+# benchmark generates equivalent specs for every suite and cluster layout
+# (kairos/mas/bench/suites.py, `scripts/run_mas_benchmark.py --dump-spec`).
+#
+#   front    assistant                talks to the user, delegates; no tools
+#   finance  accounts, payments       the user's bank: account data and transfers
+#   docs     documents                reads the user's files (untrusted content)
+#
+# The effective topology is a star around the assistant: specialists answer the
+# assistant and are not reachable from each other's clusters (peers.on_miss: DENY).
+# The documents agent reads attacker-controllable files, so it sits in its own
+# cluster: an infection there has to pass the cluster boundary to reach anything.
+version: "0.1"
+
+system:
+  name: banking-mas
+  description: "Banking assistant split into front desk, finance and documents agents."
+  entry: assistant
+
+agents:
+  assistant:
+    cluster: front
+    description: "Front-desk assistant: talks to the user and delegates to specialists."
+    policy:
+      actions: {revertable: [], non_revertable: []}
+
+  accounts:
+    cluster: finance
+    description: "Reads account data: balance, IBAN, transactions, user info; updates user info."
+    policy:
+      actions:
+        revertable: [get_iban, get_balance, get_most_recent_transactions,
+                     get_scheduled_transactions, get_user_info]
+        non_revertable: [update_password, update_user_info]
+      taints:
+        - {name: balance,    source: get_balance,                  level: high}
+        - {name: iban,       source: get_iban,                     level: high}
+        - {name: user_info,  source: get_user_info,                level: high}
+        - {name: tx_history, source: get_most_recent_transactions, level: high}
+        - {name: scheduled,  source: get_scheduled_transactions,   level: high}
+
+  payments:
+    cluster: finance
+    description: "Executes transfers: send, schedule and update transactions."
+    policy:
+      actions:
+        non_revertable: [send_money, schedule_transaction, update_scheduled_transaction]
+
+  documents:
+    cluster: docs
+    description: "Reads the user's files."
+    policy:
+      actions: {revertable: [read_file]}
+
+clusters:
+  front:
+    clearance: critical          # the user's own desk: may receive anything
+    policy:
+      default_action: REVIEW
+      contact_book:
+        peers:
+          on_miss: DENY
+          entries:
+            - {cluster: finance}
+            - {cluster: docs, max_level: low}   # file reading needs no account data
+
+  finance:
+    clearance: high
+    policy:
+      default_action: REVIEW
+      contact_book:
+        peers:
+          on_miss: DENY
+          entries:
+            - {cluster: front}
+        external:
+          lookup_fields: [recipient]
+          on_miss: REVIEW
+      rules:
+        - id: review-send-with-sensitive-payload
+          match:
+            action: [send_money, schedule_transaction, update_scheduled_transaction]
+            taint: {level_gte: high}
+          decision: REVIEW
+
+  docs:
+    clearance: low
+    policy:
+      default_action: REVIEW
+      contact_book:
+        peers:
+          on_miss: DENY
+          entries:
+            - {cluster: front}
