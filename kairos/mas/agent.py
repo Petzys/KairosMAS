@@ -37,6 +37,7 @@ from kairos.core.events import Event
 from kairos.core.extract import embedded_values
 from kairos.core.store import LabelSnapshot, TokenStore
 from kairos.engine.decision import Decision, StageResult
+from kairos.engine.integrity import _declared_strategies, _trusted
 from kairos.judge.commit import AutoCommitGate
 from kairos.judge.oracle import judge_call_record
 from kairos.mas import notices
@@ -169,6 +170,9 @@ class AgentMonitor(ReferenceMonitor):
         # dispatches a committed held tool call: (call_ref, real_args) -> (result, error)
         self.executor: Callable[[Any, dict[str, Any]], tuple[Any, Any]] | None = None
         self.oracle_calls = 0
+        self._heard_from: dict[str, list[str]] = {}     # agent -> content it sent us (lowercased)
+        # held tool calls resolved so far: call id -> ("committed", result, error) | ("aborted", ...)
+        self.call_outcomes: dict[str, tuple[str, Any, Any]] = {}
 
     # --- causal log ---------------------------------------------------------
     def record_event(self, kind: EventKind, payload: dict[str, Any], *, msg_id: str | None = None,
@@ -238,11 +242,17 @@ class AgentMonitor(ReferenceMonitor):
 
     def _after_resolution(self, trigger: str, cdec: Any, branch: Branch, outcome: ResolveOutcome) -> None:
         self.oracle_calls += 1
+        for held, res, err in outcome.dispatched:
+            cid = getattr(held.call_ref, "id", None)
+            if cid is not None and not isinstance(held.call_ref, MessageRecord):
+                self.call_outcomes[str(cid)] = ("committed", res, err)
         withheld: list[tuple[str, dict[str, Any]]] = []
         for h in outcome.aborted:
             withheld.append((h.tool, h.args))
             if isinstance(h.call_ref, MessageRecord):
                 self._drop_held(h.call_ref, cdec.verdict.rationale)
+            elif getattr(h.call_ref, "id", None) is not None:
+                self.call_outcomes[str(h.call_ref.id)] = ("aborted", None, cdec.verdict.rationale)
         ev = self.record_event(EventKind.DECISION, {
             "mode": "branch", "trigger": trigger,
             "committed": [self._action_summary(h) for h in outcome.committed],
@@ -366,8 +376,31 @@ class AgentMonitor(ReferenceMonitor):
             return self._decide_streaming(record, stage)
 
     def _evaluate(self, record: MessageRecord) -> StageResult:
-        return evaluate_message(self.spec, self.engines, record.sender, record.receiver, record.text,
-                                record.data, reply=record.reply)
+        stage = evaluate_message(self.spec, self.engines, record.sender, record.receiver, record.text,
+                                 record.data, reply=record.reply)
+        if (stage.decision is Decision.REVIEW and stage.produced_by == "embedded_identifiers"
+                and self._only_echoes(record)):
+            return StageResult(Decision.ALLOW, stage=1, produced_by="echo",
+                               reason="payload identifiers the destination itself sent")
+        return stage
+
+    def _only_echoes(self, record: MessageRecord) -> bool:
+        """Are the payload identifiers no trusted source vouches for all values the
+        DESTINATION sent this agent? Then the message introduces nothing to it --
+        a reply confirming the account it was asked to pay -- and the payload
+        check, which is about introducing values, has nothing to protect."""
+        heard = self._heard_from.get(record.receiver)
+        if not heard:
+            return False
+        eng = self.engines.messages
+        strategies = _declared_strategies(eng.policy, eng.default_strategy)
+        for _kind, value in embedded_values(record.content):
+            if _trusted(self.store, value, strategies, None, self.engines.peers):
+                continue
+            needle = value.lower()
+            if not any(needle in text for text in heard):
+                return False
+        return True
 
     def _decide_blocking(self, record: MessageRecord, stage: StageResult) -> MessageDecision:
         if self.machine.state is State.BRANCH:
@@ -487,6 +520,7 @@ class AgentMonitor(ReferenceMonitor):
                 msg_id=record.kmid, after=record.send_event, merge=record.send_clock)
             if not record.reply:
                 self.engines.peers.add_reply_target(self.spec.agents[record.sender].endpoint)
+            self._heard_from.setdefault(record.sender, []).append(record.content.lower())
             self.session.calls.append({"tool": RECV_TOOL, "decision": "ALLOW",
                                        "args": {"from": record.sender,
                                                 "kind": "reply" if record.reply else "request"},

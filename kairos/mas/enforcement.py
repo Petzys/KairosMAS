@@ -205,6 +205,7 @@ class EnforcementPoint:
         if dest is None:
             return self._external(url, msg, body)
         if not self.defense:
+            self._track_plain(dest, msg, reply=False, delivery=Delivery.BLOCKING)
             return self._forward(url, body)[0]
         rec = self.fabric.new_message(self.agent_id, dest, msg.text, msg.data, delivery=Delivery.BLOCKING)
         d = self.monitor.decide_send(rec)
@@ -241,6 +242,7 @@ class EnforcementPoint:
                 local.stream.put(self._external(url, msg, body))
                 local.stream.close()
                 return local
+            self._track_plain(dest, msg, reply=False, delivery=Delivery.STREAMING)
             self._spawn(self._forward_stream, local, body)
             return local
         rec = self.fabric.new_message(self.agent_id, dest, msg.text, msg.data, delivery=Delivery.STREAMING)
@@ -389,7 +391,7 @@ class EnforcementPoint:
         if self.defense and rec is not None and rec.receiver == self.agent_id:
             self.fabric.deliver(rec)
         resp = self.server.handle(body)
-        if not self.defense or requester not in self.spec.agents:
+        if requester not in self.spec.agents:
             return resp, {}
         return self._gate_reply(resp, requester, rec.kmid if rec else None)
 
@@ -399,7 +401,7 @@ class EnforcementPoint:
         if self.defense and rec is not None and rec.receiver == self.agent_id:
             self.fabric.deliver(rec)
         upstream = self.server.handle_stream(body)
-        if not self.defense or requester not in self.spec.agents:
+        if requester not in self.spec.agents:
             return upstream
         out = EventStream()
 
@@ -416,6 +418,13 @@ class EnforcementPoint:
         self._spawn(pump)
         return out
 
+    def _track_plain(self, dest: str, msg: InterAgentMessage, *, reply: bool, delivery: Delivery) -> None:
+        """Without a monitor nothing is decided, but the traffic is still counted, so
+        an undefended run is measured like a defended one."""
+        rec = self.fabric.new_message(self.agent_id, dest, msg.text, msg.data, reply=reply, delivery=delivery)
+        rec.intra = self.spec.same_cluster(self.agent_id, dest)
+        rec.status, rec.decision = MsgStatus.DELIVERED, "nodefense"
+
     def _gate_reply(self, body: bytes, requester: str, in_reply_to: str | None) -> tuple[bytes, Headers]:
         """Content leaving this agent for `requester`: a reply, decided like a
         blocking message (the agent has finished; nothing later to wait for)."""
@@ -424,6 +433,9 @@ class EnforcementPoint:
         except ProtocolError:
             return body, {}
         if not reply.has_content:
+            return body, {}
+        if not self.defense:
+            self._track_plain(requester, reply, reply=True, delivery=Delivery.BLOCKING)
             return body, {}
         key = (reply.task_id, reply.text + repr(reply.data))
         with self._lock:

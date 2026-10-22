@@ -111,7 +111,7 @@ class MASRuntime:
         finally:
             stop.set()
             wd.join(2.0)
-        report = self.fabric.report() if self.defense else {}
+        report = self.fabric.report()
         return SessionResult(output=result.text, elapsed=time.monotonic() - t0, report=report,
                              quiescent=quiescent)
 
