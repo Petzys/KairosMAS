@@ -23,6 +23,10 @@ class TrustToken:
     source: str
     branch_origin: str | None = None     # None => committed; else owning branch (§4.3)
     timestamp: float = 0.0
+    # The agent whose monitor admitted the value (multi-agent systems). None in a
+    # single-agent deployment. Part of equality on purpose: when two agents' sets are
+    # joined, the same value admitted by both stays recorded once per owner.
+    owner: str | None = None
 
 @dataclass(frozen=True, slots=True)
 class SensitivityToken:
@@ -32,3 +36,4 @@ class SensitivityToken:
     source: str
     branch_origin: str | None = None
     timestamp: float = 0.0
+    owner: str | None = None

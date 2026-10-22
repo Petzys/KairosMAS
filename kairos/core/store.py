@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from dataclasses import dataclass
 import re
 import time
 from typing import Any
@@ -15,15 +16,35 @@ def _strip_scheme(value: str) -> str:
     """URL-normalize for verbatim matching: lowercase, drop scheme://, trailing /."""
     return re.sub(r"^[a-z][a-z0-9+.\-]*://", "", value.strip().lower()).rstrip("/")
 
+@dataclass(frozen=True, slots=True)
+class LabelSnapshot:
+    """The committed labels of one agent's store at one point in time.
+
+    Multi-agent systems join a receiver's sets with the sender's when a message is
+    delivered (T_recv |= T_send, S_recv |= S_send). The snapshot is taken at the
+    send event, so the receiver inherits exactly what the sender knew when it wrote
+    the message, not what it learned afterwards. Every token keeps its owner.
+    """
+    owner: str | None
+    trust: frozenset[TrustToken]
+    sens: frozenset[SensitivityToken]
+    admitted_texts: tuple[tuple[str, str, str | None, str | None], ...]
+    user_prompt: str
+
+
 class TokenStore:
-    def __init__(self) -> None:
+    def __init__(self, owner: str | None = None) -> None:
+        # The agent this store belongs to (multi-agent systems); None for a
+        # single-agent deployment, where every token is the agent's own.
+        self.owner = owner
         self._trust: set[TrustToken] = set()
         self._sens: set[SensitivityToken] = set()
         self._user_prompt: str = "" # raw prompt
         # raw admitted content, for verbatim-reference queries (§4.6 navigational
         # rule). Tokens can't answer "did this exact URL appear in something the
         # agent read" — token extraction shreds URLs into words.
-        self._admitted_texts: list[tuple[str, str, str | None]] = []  # (source, lowered text, branch_origin)
+        # (source, lowered text, branch_origin, owner)
+        self._admitted_texts: list[tuple[str, str, str | None, str | None]] = []
 
     # growth
     def seed(self, user_prompt: str, cfg: ExtractConfig | None = None) -> None:
@@ -32,7 +53,8 @@ class TokenStore:
         cfg = cfg or prompt_extract_config()
         ts = time.time()
         for value in extract(user_prompt, cfg):
-            self._trust.add(TrustToken(value=value, source="user_prompt", branch_origin=None, timestamp=ts))
+            self._trust.add(TrustToken(value=value, source="user_prompt", branch_origin=None,
+                                       timestamp=ts, owner=self.owner))
 
     def user_prompt(self) -> str:
         """Expose the raw user prompt for in_user_prompt checks."""
@@ -64,10 +86,18 @@ class TokenStore:
         ts = time.time()
         for value in extract(content, extract_cfg):
             if trusted:
-                self._trust.add(TrustToken(value, source, branch_origin, ts))
+                self._trust.add(TrustToken(value, source, branch_origin, ts, self.owner))
             if level is not None:
-                self._sens.add(SensitivityToken(value, level, source, branch_origin, ts))
-        self._admitted_texts.append((source, as_text(content).lower(), branch_origin))
+                self._sens.add(SensitivityToken(value, level, source, branch_origin, ts, self.owner))
+        self._admitted_texts.append((source, as_text(content).lower(), branch_origin, self.owner))
+
+    def record_text(self, content: Any, source: str) -> None:
+        """Remember raw content for provenance queries WITHOUT admitting tokens.
+
+        Untrusted, non-sensitive content (a message from another agent) enters
+        neither set, but `sources_of` must still be able to say "this value came from
+        that message" -- the attribution the oracle checks a delegation against."""
+        self._admitted_texts.append((source, as_text(content).lower(), None, self.owner))
 
     # active-set helpers (committed-onyl when branch is None)
     def _active_trust(self, branch: str | None) -> set[TrustToken]:
@@ -136,7 +166,7 @@ class TokenStore:
             return False
         if needle in self._user_prompt.lower():
             return True
-        return any(needle in text for (_src, text, bo) in self._admitted_texts
+        return any(needle in text for (_src, text, bo, _own) in self._admitted_texts
                    if bo is None or bo == branch)
 
     def sources_of(self, value: str, branch: str | None = None,
@@ -161,16 +191,26 @@ class TokenStore:
         """
         hits: list[str] = []
         for t in self._active_trust(branch):
-            if t.source not in hits and matches(value, t.value, strategy):
-                hits.append(t.source)
+            label = self._qualified(t.source, t.owner)
+            if label not in hits and matches(value, t.value, strategy):
+                hits.append(label)
         needle = _strip_scheme(value)
         if needle:
-            for src, text, bo in self._admitted_texts:
+            for src, text, bo, own in self._admitted_texts:
                 if bo is not None and bo != branch:
                     continue
-                if src not in hits and needle in text:
-                    hits.append(src)
+                label = self._qualified(src, own)
+                if label not in hits and needle in text:
+                    hits.append(label)
         return hits
+
+    def _qualified(self, source: str, owner: str | None) -> str:
+        """A source as seen from this store: its own sources bare, another agent's
+        prefixed with that agent ("documents/read_file"), so a joined value names
+        the agent whose boundary it crossed."""
+        if owner is None or owner == self.owner:
+            return source
+        return f"{owner}/{source}"
 
     def in_user_prompt(self, value: str, strategy: Strategy = Strategy.NORMALIZED) -> bool:
         """Does `value` appear in the user's prompt? (origin: param_in_user_prompt, §4.4)
@@ -198,8 +238,8 @@ class TokenStore:
         self._sens -= prompte_s
         self._sens |= {dataclasses.replace(t, branch_origin=None) for t in prompte_s}
         self._admitted_texts = [
-            (src, text, None if bo == branch_id else bo)
-            for (src, text, bo) in self._admitted_texts
+            (src, text, None if bo == branch_id else bo, own)
+            for (src, text, bo, own) in self._admitted_texts
         ]
 
     def abort_branch(self, branch_id: str) -> None:
@@ -207,3 +247,36 @@ class TokenStore:
         self._trust = {t for t in self._trust if t.branch_origin != branch_id}
         self._sens = {t for t in self._sens if t.branch_origin != branch_id}
         self._admitted_texts = [t for t in self._admitted_texts if t[2] != branch_id]
+
+    # multi-agent label flow
+    def snapshot(self) -> LabelSnapshot:
+        """The committed T, S and admitted texts, for a join into another store."""
+        return LabelSnapshot(
+            owner=self.owner,
+            trust=frozenset(t for t in self._trust if t.branch_origin is None),
+            sens=frozenset(t for t in self._sens if t.branch_origin is None),
+            admitted_texts=tuple(a for a in self._admitted_texts if a[2] is None),
+            user_prompt=self._user_prompt,
+        )
+
+    def join(self, snap: LabelSnapshot) -> None:
+        """T |= T_snap, S |= S_snap (labels of a message's sender).
+
+        Safe for T: the monitor computes it from the user prompt and declared
+        trusted sources only, so a compromised sender cannot place a value in it.
+        Conservative for S: a value the sender held at any level is held here at
+        that level too; conflicting levels resolve to the maximum, because
+        sensitivity_of already takes the max over matching tokens. Owners are kept.
+
+        The raw prompt is the principal's: every agent's work descends from it, so
+        a store that has none yet takes the sender's."""
+        self._trust |= snap.trust
+        self._sens |= snap.sens
+        have = {(src, text, own) for (src, text, _bo, own) in self._admitted_texts}
+        for src, text, bo, own in snap.admitted_texts:
+            key = (src, text, own)
+            if key not in have:
+                have.add(key)
+                self._admitted_texts.append((src, text, bo, own))
+        if not self._user_prompt and snap.user_prompt:
+            self._user_prompt = snap.user_prompt
