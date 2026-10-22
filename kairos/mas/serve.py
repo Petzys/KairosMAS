@@ -23,7 +23,8 @@ listeners. The principal starts a session on the control endpoint:
     GET  /report                      -> the current session report
 
 Oracle: deterministic by default; --oracle llm uses the lineage-aware LLM oracle
-(KAIROS_JUDGE_MODEL, KAIROS_JUDGE_BASE_URL, KAIROS_JUDGE_API_KEY or OPENAI_API_KEY).
+(KAIROS_JUDGE_MODEL, KAIROS_JUDGE_BASE_URL, KAIROS_JUDGE_API_KEY or OPENAI_API_KEY;
+KAIROS_JUDGE_MODEL=stub runs that path offline, without a key).
 """
 from __future__ import annotations
 
@@ -52,6 +53,7 @@ from kairos.mas.fabric import MonitorFabric
 from kairos.mas.oracle import MASJudge
 from kairos.mas.spec import MASSpec, endpoint_origin
 from kairos.mas.spec_parser import load_spec
+from kairos.mas.stub_llm import StubChatClient, is_stub
 
 
 @dataclass(slots=True)
@@ -73,12 +75,18 @@ def load_hosts(path: str | Path) -> dict[str, HostConfig]:
 def judge_factory(kind: str):
     if kind == "deterministic":
         return lambda _m: DeterministicJudge()
-    key = os.environ.get("KAIROS_JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    kwargs: dict[str, Any] = {"api_key": key}
-    if os.environ.get("KAIROS_JUDGE_BASE_URL"):
-        kwargs["base_url"] = os.environ["KAIROS_JUDGE_BASE_URL"]
-    client = openai.OpenAI(**kwargs)
-    model = os.environ.get("KAIROS_JUDGE_MODEL", "gpt-4o-mini")
+    model = os.environ.get("KAIROS_JUDGE_MODEL") or "gpt-4o-mini"   # empty stub = unset
+    if is_stub(model):                     # offline: the LLM oracle path without a key
+        client: Any = StubChatClient()
+    else:
+        key = os.environ.get("KAIROS_JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise SystemExit("ERROR: --oracle llm needs KAIROS_JUDGE_API_KEY or OPENAI_API_KEY "
+                             "(or KAIROS_JUDGE_MODEL=stub to run the oracle offline)")
+        kwargs: dict[str, Any] = {"api_key": key}
+        if os.environ.get("KAIROS_JUDGE_BASE_URL"):
+            kwargs["base_url"] = os.environ["KAIROS_JUDGE_BASE_URL"]
+        client = openai.OpenAI(**kwargs)
     return lambda m: MASJudge(client, model, m, prompt="production")
 
 

@@ -25,13 +25,16 @@ from agentdojo.types import text_content_block_from_string
 
 from kairos.mas.a2a.adapter import Delivery
 from kairos.mas.bench.environment import Exposure, ToolBox
+from kairos.adapters.agentdojo.telemetry import instrument_client
 from kairos.mas.bench.llm import LLMAgents
 from kairos.mas.bench.oracles import InjectionMatcher, effect_tools, judge_factory
 from kairos.mas.bench.scripted import ScriptedSystem
+from kairos.mas.bench.stub_agents import PlanReplayPolicy
 from kairos.mas.bench.suites import POLICY_DIR, SYSTEMS, BuildOptions, build_spec
 from kairos.mas.fabric import MonitorFabric
 from kairos.mas.runtime import MASRuntime
 from kairos.mas.spec import A2A_REPLY, A2A_SEND
+from kairos.mas.stub_llm import StubChatClient, is_stub
 
 
 @dataclass(slots=True)
@@ -118,6 +121,10 @@ def make_attack(cfg: RunConfig, suite: Any) -> Any:
     return load_attack(cfg.attack, suite, _AttackTarget(name=name))
 
 
+def _metered(client: Any, meter: Any) -> Any:
+    return instrument_client(client, meter) if meter is not None else client
+
+
 def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | None,
              injections: dict[str, str], *, client: Any = None, judge_client: Any = None,
              meter: Any = None, verbose: bool = False) -> PairResult:
@@ -133,6 +140,14 @@ def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | N
     judges: list[Any] = []
     effects = effect_tools(cfg.suite)
     exposure = Exposure.for_injection(injection_task.GOAL if injection_task else None, injections.values())
+    # the offline `stub` model (no API key): per pair, because the stub agents replay this
+    # pair's plan; metered like a real client so the token accounting path runs too
+    if cfg.backend == "llm" and is_stub(cfg.model):
+        client = _metered(StubChatClient(PlanReplayPolicy(
+            spec, system, plan=plan, injection_plan=injection_plan, payload=exposure.contains,
+            final_output=user_task.GROUND_TRUTH_OUTPUT)), meter)
+    if cfg.oracle == "llm" and is_stub(cfg.judge_model):
+        judge_client = _metered(StubChatClient(), meter)
     make_judge = judge_factory(cfg.oracle, injection_plan=injection_plan, user_plan=plan, effects=effects,
                                payload=exposure.contains, client=judge_client, model=cfg.judge_model,
                                prompt=cfg.judge_prompt)

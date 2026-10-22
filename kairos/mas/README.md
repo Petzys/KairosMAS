@@ -179,6 +179,16 @@ counts). Agent labels are cut out of the suite's single-agent policy
   the payload) and re-issues a withheld request once. Bit-for-bit reproducible, no API
   key. `llm` — tool-calling LLM agents with `send_message`, `delegate_task`,
   `get_task_result`.
+* **Offline `stub` model** (no API key): `--backend llm --model stub` and/or
+  `--oracle llm --judge-model stub` run the complete LLM code paths — AgentDojo's
+  `OpenAILLM` loop, the messaging tools, notices and re-entry, `MASJudge` with lineage,
+  token metering — against an offline stand-in ([`stub_llm.py`](stub_llm.py)). As an
+  agent it replays the task's plan like the scripted backend, but through chat messages
+  and tool calls ([`bench/stub_agents.py`](bench/stub_agents.py)); as the oracle it
+  refuses an action whose identifiers occur in injected text. It tests the harness and
+  the monitor, it does not measure a model. `KAIROS_JUDGE_MODEL=stub` does the same for
+  `python -m kairos.mas.serve --oracle llm`. Key stubs for the real providers are in
+  [`.env.example`](../../.env.example).
 * **Oracles**: `gt` (ideal: refuses exactly the injection's effects — isolates the
   monitor's mechanics from oracle errors), `gt-contain` (plus a perfect payload detector
   at cluster boundaries), `approve`, `deny`, `deterministic`, `llm` (`MASJudge`).
@@ -281,7 +291,9 @@ MASDojo (`_bench`, incl. the LLM backend and oracle driven by a fake model).
 ## Limitations and next steps
 
 * No LLM-agent numbers are included: this environment has no API keys. The LLM backend
-  and oracle are exercised with a scripted fake model only.
+  and oracle are exercised end to end with the offline `stub` model, which is not a
+  measurement of any model; fill in the key stubs in `.env` and run
+  `evaluation/mas/run_masdojo.sh llm --go`.
 * In a microVM deployment, agents' *external* effects still pass the single-agent
   deploy stack (`deploy/net`, `deploy/fs`); wiring its control plane to the MAS decision
   points (one `AgentMonitor` per host instead of a per-session store) is the next step.

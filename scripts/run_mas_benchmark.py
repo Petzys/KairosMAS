@@ -10,6 +10,8 @@ interrupted run resumes, and a summary per suite is printed and saved.
   # LLM agents and the LLM oracle:
   python scripts/run_mas_benchmark.py --backend llm --model gpt-4o-mini --oracle llm \\
       --suite banking --layout domain
+  # the same code paths offline, without an API key (stub model; not a measurement):
+  python scripts/run_mas_benchmark.py --backend llm --model stub --oracle llm --judge-model stub
 
 Reported per suite:
   utility        % benign user tasks solved
@@ -42,6 +44,7 @@ from kairos.mas.bench.harness import RunConfig, run_suite, summarize  # noqa: E4
 from kairos.mas.bench.oracles import ORACLES  # noqa: E402
 from kairos.mas.bench.suites import LAYOUTS, SYSTEMS, BuildOptions, build_spec  # noqa: E402
 from kairos.mas.spec_parser import dump_spec  # noqa: E402
+from kairos.mas.stub_llm import is_stub  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,8 +86,13 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+_NO_KEY = ("; to run every LLM code path offline without a key, use the stub provider: "
+           "--model stub / --judge-model stub (see .env.example)")
+
+
 def _clients(args: argparse.Namespace):
-    """Agent and judge clients, metered (only for the llm backend / llm oracle)."""
+    """Agent and judge clients, metered (only for the llm backend / llm oracle). The
+    offline `stub` model needs no client here: each task builds its own."""
     if args.backend != "llm" and args.oracle != "llm":
         return None, None, None
     import openai
@@ -92,27 +100,29 @@ def _clients(args: argparse.Namespace):
     from kairos.adapters.agentdojo.telemetry import TokenMeter, instrument_client
     meter = TokenMeter()
     client = None
-    if args.backend == "llm":
+    if args.backend == "llm" and not is_stub(args.model):
         base = args.agent_base_url or ("https://openrouter.ai/api/v1" if "/" in args.model else None)
         if base:
             key = os.environ.get(args.agent_api_key_env) or os.environ.get("OPENROUTER_API_KEY")
             if not key:
-                sys.exit(f"ERROR: {args.model} routes to {base} but ${args.agent_api_key_env} is unset")
+                sys.exit(f"ERROR: {args.model} routes to {base} but ${args.agent_api_key_env} is unset"
+                         + _NO_KEY)
             client = instrument_client(openai.OpenAI(base_url=base, api_key=key), meter)
         else:
             if not os.environ.get("OPENAI_API_KEY"):
-                sys.exit("ERROR: OPENAI_API_KEY not set")
+                sys.exit("ERROR: OPENAI_API_KEY not set" + _NO_KEY)
             client = instrument_client(openai.OpenAI(), meter)
     judge_client = None
-    if args.oracle == "llm":
+    if args.oracle == "llm" and not is_stub(args.judge_model):
         if args.judge_base_url:
             key = os.environ.get(args.judge_api_key_env) or os.environ.get("OPENAI_API_KEY")
             if not key:
-                sys.exit(f"ERROR: --judge-base-url needs ${args.judge_api_key_env} or $OPENAI_API_KEY")
+                sys.exit(f"ERROR: --judge-base-url needs ${args.judge_api_key_env} or $OPENAI_API_KEY"
+                         + _NO_KEY)
             judge_client = instrument_client(openai.OpenAI(base_url=args.judge_base_url, api_key=key), meter)
         else:
             if not os.environ.get("OPENAI_API_KEY"):
-                sys.exit("ERROR: the llm oracle needs OPENAI_API_KEY (or --judge-base-url)")
+                sys.exit("ERROR: the llm oracle needs OPENAI_API_KEY (or --judge-base-url)" + _NO_KEY)
             judge_client = instrument_client(openai.OpenAI(), meter)
     return client, judge_client, meter
 

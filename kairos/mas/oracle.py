@@ -145,7 +145,25 @@ def _args(args: dict[str, Any]) -> str:
     return ", ".join(f"{k}={_clip(v, 120)}" for k, v in args.items())
 
 
-def render_event(ev: CausalEvent) -> str:
+_AROUND = 450
+
+
+def _excerpt(text: Any, focus: str = "", n: int = _LINE) -> str:
+    """The start of `text`, plus -- when the traced value occurs past the cut -- the
+    passage around it. A prefix alone hides exactly what the oracle needs: an
+    instruction injected deep into a long result (a transaction list, a page)."""
+    t = str(text)
+    if len(t) <= n or not focus:
+        return _clip(t, n)
+    i = t.lower().find(focus.lower())
+    if i < 0 or i + len(focus) <= n:
+        return _clip(t, n)
+    head = t[: n // 3]
+    lo, hi = max(len(head), i - _AROUND), min(len(t), i + len(focus) + _AROUND)
+    return _clip(head, n) + " … " + t[lo:hi].replace("\n", " ⏎ ") + (" …" if hi < len(t) else "")
+
+
+def render_event(ev: CausalEvent, focus: str = "") -> str:
     p = ev.payload
     k = ev.kind
     if k is EventKind.PROMPT:
@@ -153,17 +171,17 @@ def render_event(ev: CausalEvent) -> str:
     if k is EventKind.TOOL_CALL:
         return f"called {p.get('tool')}({_args(p.get('args') or {})}) [{p.get('decision')}]"
     if k is EventKind.TOOL_RESULT:
-        return f"result of {p.get('tool')}: {_clip(p.get('result', ''))}  <<UNTRUSTED DATA>>"
+        return f"result of {p.get('tool')}: {_excerpt(p.get('result', ''), focus)}  <<UNTRUSTED DATA>>"
     if k is EventKind.SEND:
         what = "replied to" if p.get("reply") else "sent a message to"
         notes = ""
         if p.get("annotations"):
             notes = "  [deterministic check: " + "; ".join(
                 f"{a}: {b}" for a, b in p["annotations"].items()) + "]"
-        return f"{what} '{p.get('to')}' [{p.get('decision')}]: {_clip(p.get('text', ''))}{notes}"
+        return f"{what} '{p.get('to')}' [{p.get('decision')}]: {_excerpt(p.get('text', ''), focus)}{notes}"
     if k is EventKind.RECV:
         what = "received a reply from" if p.get("reply") else "received a message from"
-        return f"{what} '{p.get('from')}': {_clip(p.get('text', ''))}  <<UNTRUSTED DATA>>"
+        return f"{what} '{p.get('from')}': {_excerpt(p.get('text', ''), focus)}  <<UNTRUSTED DATA>>"
     if k is EventKind.DECISION:
         withheld = ", ".join(f"{a['tool']}({_args(a['args'])})" for a in p.get("aborted", []))
         done = ", ".join(a["tool"] for a in p.get("committed", []))
@@ -187,7 +205,7 @@ def render_segment(seg: LineageSegment) -> list[str]:
                 skipped = True
             continue
         skipped = False
-        lines.append(f"    {e.seq}. {render_event(e)}")
+        lines.append(f"    {e.seq}. {render_event(e, seg.focus)}")
     return lines
 
 

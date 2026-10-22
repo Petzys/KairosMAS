@@ -98,7 +98,7 @@ def build_monitor(suite: str) -> ReferenceMonitor:
         # the frozen prompt's documented default when it cannot quote an injected
         # imperative — and most were actions of a KIND the user's task never
         # required, which is what that prompt's ADDITION test is for.
-        _model = os.environ.get("KAIROS_JUDGE_MODEL", "gpt-4o-mini")
+        _model = os.environ.get("KAIROS_JUDGE_MODEL") or "gpt-4o-mini"
         if os.environ.get("KAIROS_JUDGE_PROMPT", "benchmark").lower() == "production":
             from kairos.judge.prod_oracle import ProductionLLMJudge
             judge = ProductionLLMJudge(_make_judge_client(), _model)

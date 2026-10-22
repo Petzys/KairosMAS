@@ -252,7 +252,7 @@ def make_llm_judge(model: str | None = None, client: Any = None) -> LLMJudge | N
     KAIROS_JUDGE_API_KEY first and only falls back to OPENAI_API_KEY. Keying solely
     off OPENAI_API_KEY meant a non-OpenAI base URL was contacted unauthenticated
     and every REVIEW quietly degraded to the deterministic rule."""
-    model = model or os.environ.get("KAIROS_JUDGE_MODEL", "gpt-4o-mini")
+    model = model or os.environ.get("KAIROS_JUDGE_MODEL") or "gpt-4o-mini"
     if client is None:
         key = os.environ.get("KAIROS_JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY")
         if not key:
