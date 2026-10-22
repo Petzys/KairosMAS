@@ -230,6 +230,10 @@ commands above (`--logdir` to keep them apart from other runs).
 | travel | domain | gt | 100.0 | 100.0 | **0.0** | 2.60 / 6.74 | 16.3 | 1.37 / 0.44 | 2.00 |
 | travel | singleton | gt | 100.0 | 100.0 | **0.0** | 2.60 / 6.74 | 16.3 | 1.37 / 0.44 | 2.25 |
 
+Streamed hand-offs (`--dispatch stream`, domain and singleton layouts) give the same
+utility, ASR and oracle calls as blocking ones; 0.1 (banking) to 2.8 (travel) messages per
+task are held in the sender's scope and released when the front desk awaits them.
+
 Containment against utility (`--oracle gt-contain`, domain layout): exposure drops to
 1.03 / 1.05 / 1.03 / 1.58 clusters (banking / slack / workspace / travel) with ASR still
 0.0, but utility under attack falls to 87.5 / 76.2 / 42.5 / 57.9 — the payload sits in
