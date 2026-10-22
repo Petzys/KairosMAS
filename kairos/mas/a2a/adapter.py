@@ -16,7 +16,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 from kairos.mas.a2a.protocol import (
-    ArtifactUpdate, Message, Method, ProtocolError, Request, Response, Result,
+    ArtifactUpdate, Message, Method, ProtocolError, Request, Response, Result, RpcError,
     StatusUpdate, Task, TaskState, TaskStatus, new_id, parse_request, parse_response,
     parse_sse, result_text,
 )
@@ -125,6 +125,54 @@ class A2AAdapter:
         return InterAgentMessage(kind=CommKind.REPLY, delivery=Delivery.BLOCKING,
                                  text=result_text(res), data=data, task_id=task_id,
                                  context_id=context_id, final=final, state=state, raw=resp)
+
+    # --- canonical forms: forward exactly what was decided --------------------
+    def canonical_request(self, msg: InterAgentMessage, *, task_id: str | None = None,
+                          context_id: str | None = None) -> bytes:
+        """The request re-serialized from what the monitor checked: the message parts
+        and the delivery mode. Agent-chosen free fields -- message and request
+        metadata, unknown params, its own message id, task and context ids the
+        monitor cannot map -- are not forwarded: they would carry content past the
+        decision. `task_id` / `context_id` are the PEER's ids the monitor mapped."""
+        req = msg.raw
+        assert isinstance(req, Request)
+        m = req.message
+        parts = m.parts if m is not None else []
+        out = Message(role="user", parts=parts, message_id=new_id("msg-"),
+                      context_id=context_id, task_id=task_id)
+        params: dict[str, Any] = {"message": out.to_dict()}
+        if req.method is Method.SEND:
+            params["configuration"] = {"blocking": msg.delivery is Delivery.BLOCKING}
+        return Request(method=req.method, params=params, id=req.id).to_bytes()
+
+    @staticmethod
+    def canonical_poll(msg: InterAgentMessage, remote_task_id: str) -> bytes:
+        req = msg.raw
+        assert isinstance(req, Request)
+        return Request(method=req.method, params={"id": remote_task_id}, id=req.id).to_bytes()
+
+    def canonical_reply(self, body: bytes | str | dict[str, Any]) -> tuple[bytes, InterAgentMessage] | None:
+        """A reply re-serialized from its checked view (artifacts, status and its
+        message, update fields; no history, no metadata), with that view. None when
+        the body is not a well-formed A2A response: fail closed, never pass it on."""
+        try:
+            resp = parse_response(body)
+        except ProtocolError:
+            return None
+        res = resp.result
+        if resp.error is not None:
+            canon = Response(id=resp.id, error=RpcError(resp.error.code, resp.error.message))
+        elif isinstance(res, Task):
+            canon = Response(id=resp.id, result=Task(id=res.id, context_id=res.context_id,
+                                                     status=res.status, artifacts=res.artifacts))
+        elif isinstance(res, (Message, StatusUpdate, ArtifactUpdate)):
+            if isinstance(res, Message):
+                res = Message(role="agent", parts=res.parts, message_id=res.message_id,
+                              context_id=res.context_id, task_id=res.task_id)
+            canon = Response(id=resp.id, result=res)
+        else:
+            return None
+        return canon.to_bytes(), self._reply(canon)
 
     # --- what the monitor answers itself -----------------------------------
     def working(self, request: InterAgentMessage, task_id: str) -> bytes:

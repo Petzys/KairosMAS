@@ -14,6 +14,7 @@ monitor's own message ids, which travel between enforcement points out of band.
 from __future__ import annotations
 
 import itertools
+import secrets
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -65,6 +66,9 @@ class MonitorFabric:
         self.downstream_notices = downstream_notices
         self._lock = threading.Lock()
         self._ids = itertools.count(1)
+        # authenticates the principal's channel (a deployment's control endpoint) at the
+        # entry agent's ingress; never given to agents
+        self.principal_token = secrets.token_hex(16)
         self.dps: dict[str, ClusterDecisionPoint] = {}
         self.messages: dict[str, MessageRecord] = {}
         self.prompt = ""

@@ -97,3 +97,29 @@ def test_events_upto_and_lookup() -> None:
     assert [e.seq for e in log.events("a", upto=3)] == [1, 2, 3]
     assert log.event(("a", 4)).seq == 4 and log.event(("a", 9)) is None
     assert log.delivered(("a", 5)) and not log.delivered(("a", 6))
+
+
+def test_two_logs_waiting_on_each_other_do_not_deadlock() -> None:
+    """Two decision points deliver RECVs that depend on each other's SENDs at the same
+    time: each holds its own log while asking the other (regression: lock-order
+    inversion between two clusters exchanging messages)."""
+    logs: dict[str, CausalLog] = {}
+    logs["a"] = CausalLog(foreign_delivered=lambda eid: logs["b"].delivered(eid))
+    logs["b"] = CausalLog(foreign_delivered=lambda eid: logs["a"].delivered(eid))
+    for i in range(1, 201):
+        logs["a"].submit(_ev("a", i))
+        logs["b"].submit(_ev("b", i))
+    barrier = threading.Barrier(2)
+
+    def run(me, other):
+        barrier.wait()
+        for i in range(201, 401):
+            logs[me].submit(_ev(me, i, EventKind.RECV, after=(other, i - 200)))
+
+    ts = [threading.Thread(target=run, args=("a", "b")), threading.Thread(target=run, args=("b", "a"))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=10)
+    assert not any(t.is_alive() for t in ts), "deadlock"
+    assert logs["a"].frontier("a") == 400 and logs["b"].frontier("b") == 400

@@ -141,6 +141,11 @@ class CausalLog:
 
     def __init__(self, foreign_delivered: Callable[[EventId], bool] | None = None) -> None:
         self._events: dict[str, list[CausalEvent]] = {}
+        # highest delivered sequence number per agent. Written only under _cv, READ without
+        # it: other decision points ask whether an event was delivered while holding their
+        # own log's lock, and taking ours there would order two log locks both ways
+        # (deadlock between two clusters exchanging messages).
+        self._frontier: dict[str, int] = {}
         self._pending: list[CausalEvent] = []
         self._foreign = foreign_delivered or (lambda _eid: False)
         self._cv = threading.Condition()
@@ -174,6 +179,7 @@ class CausalLog:
                 if self._ready(ev):
                     self._pending.remove(ev)
                     self._events.setdefault(ev.agent, []).append(ev)
+                    self._frontier[ev.agent] = ev.seq
                     delivered.append(ev)
                     progress = True
         return delivered
@@ -191,12 +197,11 @@ class CausalLog:
 
     # --- queries ------------------------------------------------------------
     def delivered(self, eid: EventId) -> bool:
-        with self._cv:
-            return self._is_delivered(eid)
+        """Lock-free: safe to call from another log's critical section."""
+        return self._is_delivered(eid)
 
     def frontier(self, agent: str) -> int:
-        evs = self._events.get(agent)
-        return evs[-1].seq if evs else 0
+        return self._frontier.get(agent, 0)
 
     def events(self, agent: str, upto: int | None = None) -> list[CausalEvent]:
         with self._cv:

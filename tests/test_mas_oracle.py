@@ -103,12 +103,31 @@ def test_context_request_round_expands_the_lineage() -> None:
     assert "MORE CONTEXT AVAILABLE" not in client.prompts[1]          # one round only
 
 
-def test_unanswerable_context_request_fails_closed() -> None:
+def test_unanswerable_context_request_gets_one_closing_round() -> None:
     fab = MonitorFabric(banking_spec())
     fab.begin_session("hi")
-    client = FakeClient([json.dumps({"request_context": ["nobody"]})])
+    client = FakeClient([json.dumps({"request_context": ["nobody"]}), VERDICT_OK])
+    v = MASJudge(client, "m", fab.agent("assistant")).evaluate("hi", _held_transfer())
+    assert v.consistent                                   # decided in the closing round
+    assert "not part of this lineage" in client.prompts[1] and "Do NOT request" in client.prompts[1]
+
+
+def test_a_model_that_keeps_requesting_fails_closed_explicitly() -> None:
+    fab = MonitorFabric(banking_spec())
+    fab.begin_session("hi")
+    req = json.dumps({"request_context": ["nobody"]})
+    client = FakeClient([req, req, req])
     v = MASJudge(client, "m", fab.agent("assistant"), max_context_rounds=0).evaluate("hi", _held_transfer())
-    assert not v.consistent
+    assert not v.consistent and "requested context instead of deciding" in v.rationale
+    assert len(client.prompts) == 2                       # the request, then one closing round
+
+
+def test_empty_verdict_is_not_called_consistent() -> None:
+    fab = MonitorFabric(banking_spec())
+    fab.begin_session("hi")
+    v = MASJudge(FakeClient([json.dumps({"actions": []})]), "m", fab.agent("assistant")).evaluate(
+        "hi", _held_transfer())
+    assert not v.consistent and "failing closed" in v.rationale
 
 
 def test_transport_failure_fails_closed() -> None:

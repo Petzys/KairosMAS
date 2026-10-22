@@ -93,9 +93,15 @@ def test_reply_to_requester_needs_no_topology_but_keeps_confidentiality() -> Non
         raw["clusters"]["docs"]["policy"]["contact_book"]["peers"]["on_miss"] = "REVIEW"
     spec = banking_spec(m)
     eng, store = _engines(spec, "accounts", "hi")
-    eng.peers.add_reply_target(spec.agents["documents"].endpoint)     # documents asked accounts
     plain = evaluate_message(spec, eng, "accounts", "documents", "done", reply=True)
     assert plain.decision is Decision.ALLOW
+    # ... but answering documents once does not make a NEW request to it known
+    def m2(raw):
+        raw["clusters"]["finance"]["policy"]["contact_book"]["peers"]["on_miss"] = "REVIEW"
+    spec2 = banking_spec(m2)
+    eng2, _ = _engines(spec2, "accounts", "hi")
+    assert evaluate_message(spec2, eng2, "accounts", "documents", "x", reply=True).decision is Decision.ALLOW
+    assert evaluate_message(spec2, eng2, "accounts", "documents", "x").decision is Decision.REVIEW
     store.admit("balance 9876.54", "get_balance", trusted=False, level=Level.HIGH,
                 branch_origin=None, extract_cfg=ExtractConfig())
     secret = evaluate_message(spec, eng, "accounts", "documents", "balance 9876.54", reply=True)

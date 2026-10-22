@@ -30,6 +30,7 @@ class LabelSnapshot:
     sens: frozenset[SensitivityToken]
     admitted_texts: tuple[tuple[str, str, str | None, str | None], ...]
     user_prompt: str
+    provenance_texts: tuple[tuple[str, str, str | None], ...] = ()
 
 
 class TokenStore:
@@ -45,6 +46,10 @@ class TokenStore:
         # agent read" — token extraction shreds URLs into words.
         # (source, lowered text, branch_origin, owner)
         self._admitted_texts: list[tuple[str, str, str | None, str | None]] = []
+        # content recorded for ATTRIBUTION only (messages from other agents): sources_of
+        # scans it, seen_verbatim does not -- a URL a peer merely wrote is not one the
+        # agent read, so it must not make a GET to it "navigation". (source, text, owner)
+        self._provenance_texts: list[tuple[str, str, str | None]] = []
 
     # growth
     def seed(self, user_prompt: str, cfg: ExtractConfig | None = None) -> None:
@@ -66,6 +71,7 @@ class TokenStore:
         self._sens.clear()
         self._user_prompt = ""
         self._admitted_texts.clear()
+        self._provenance_texts.clear()
 
     def admit(
         self,
@@ -96,8 +102,9 @@ class TokenStore:
 
         Untrusted, non-sensitive content (a message from another agent) enters
         neither set, but `sources_of` must still be able to say "this value came from
-        that message" -- the attribution the oracle checks a delegation against."""
-        self._admitted_texts.append((source, as_text(content).lower(), None, self.owner))
+        that message" -- the attribution the oracle checks a delegation against. It
+        does not feed seen_verbatim (the navigational-reference rule)."""
+        self._provenance_texts.append((source, as_text(content).lower(), self.owner))
 
     # active-set helpers (committed-onyl when branch is None)
     def _active_trust(self, branch: str | None) -> set[TrustToken]:
@@ -202,6 +209,10 @@ class TokenStore:
                 label = self._qualified(src, own)
                 if label not in hits and needle in text:
                     hits.append(label)
+            for src, text, own in self._provenance_texts:
+                label = self._qualified(src, own)
+                if label not in hits and needle in text:
+                    hits.append(label)
         return hits
 
     def _qualified(self, source: str, owner: str | None) -> str:
@@ -257,6 +268,7 @@ class TokenStore:
             sens=frozenset(t for t in self._sens if t.branch_origin is None),
             admitted_texts=tuple(a for a in self._admitted_texts if a[2] is None),
             user_prompt=self._user_prompt,
+            provenance_texts=tuple(self._provenance_texts),
         )
 
     def join(self, snap: LabelSnapshot) -> None:
@@ -278,5 +290,10 @@ class TokenStore:
             if key not in have:
                 have.add(key)
                 self._admitted_texts.append((src, text, bo, own))
+        known = set(self._provenance_texts)
+        for item in snap.provenance_texts:
+            if item not in known:
+                known.add(item)
+                self._provenance_texts.append(item)
         if not self._user_prompt and snap.user_prompt:
             self._user_prompt = snap.user_prompt

@@ -48,7 +48,7 @@ from starlette.routing import Route
 from kairos.judge.oracle import DeterministicJudge
 from kairos.mas.a2a.client import A2AClient
 from kairos.mas.a2a.http import HttpAgentServer, HttpNetwork, egress_app, ingress_app, read_body
-from kairos.mas.enforcement import EnforcementPoint
+from kairos.mas.enforcement import PRINCIPAL_HEADER, EnforcementPoint
 from kairos.mas.fabric import MonitorFabric
 from kairos.mas.oracle import MASJudge
 from kairos.mas.spec import MASSpec, endpoint_origin
@@ -114,14 +114,16 @@ class Deployment:
 
     def run_session(self, prompt: str) -> dict[str, Any]:
         """The principal's prompt: seed T_0, then deliver it to the entry agent through
-        its ingress (a request with no monitor id: the principal, not an agent)."""
+        its ingress, authenticated as the principal (a request without a valid monitor
+        capability or the principal's token is treated as an outside party)."""
         with self._lock:
             self.fabric.begin_session(prompt)
             for ep in self.eps.values():
                 ep.reset()
             entry = self.spec.entry
-            client = A2AClient(lambda url, body: self.network.request(url, body, {})[0],
-                               lambda url, body: self.network.stream(url, body, {}))
+            principal = {PRINCIPAL_HEADER: self.fabric.principal_token}
+            client = A2AClient(lambda url, body: self.network.request(url, body, principal)[0],
+                               lambda url, body: self.network.stream(url, body, principal))
             r = client.send_message(self.spec.agents[entry].endpoint, prompt)
             deadline = time.monotonic() + 60
             for ep in self.eps.values():
@@ -145,7 +147,10 @@ def _server(bind: str, app: Starlette) -> uvicorn.Server:
     return uvicorn.Server(uvicorn.Config(app, host=host or "127.0.0.1", port=int(port), log_level="warning"))
 
 
-def start(deployment: Deployment, control: str) -> list[uvicorn.Server]:
+def start(deployment: Deployment, control: str, *, tick: float = 1.0) -> list[uvicorn.Server]:
+    """Start every listener and the budget watchdog. Unmodified agents never tell the
+    monitor they are waiting on a held stream, so the stall budget is what bounds a
+    hand-off: the watchdog resolves branches whose budget ran out."""
     servers = [_server(bind, app) for bind, app in deployment.apps()]
     servers.append(_server(control, deployment.control_app()))
     for s in servers:
@@ -155,6 +160,13 @@ def start(deployment: Deployment, control: str) -> list[uvicorn.Server]:
         if time.monotonic() > deadline:
             raise RuntimeError("listeners did not start")
         time.sleep(0.02)
+
+    def watchdog() -> None:
+        while not all(s.should_exit for s in servers):
+            time.sleep(tick)
+            deployment.fabric.tick()
+
+    threading.Thread(target=watchdog, daemon=True).start()
     return servers
 
 
@@ -165,9 +177,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--control", default="127.0.0.1:9000")
     p.add_argument("--oracle", default="deterministic", choices=["deterministic", "llm"])
     p.add_argument("--hold-notice", default="honest", choices=["honest", "success"])
+    p.add_argument("--stall-budget", type=float, default=120.0,
+                   help="seconds a held effect may wait for its agent's next trigger")
     args = p.parse_args(argv)
     spec = load_spec(args.spec)
-    fabric = MonitorFabric(spec, judge_factory=judge_factory(args.oracle), hold_notice=args.hold_notice)
+    fabric = MonitorFabric(spec, judge_factory=judge_factory(args.oracle), hold_notice=args.hold_notice,
+                           max_stall_seconds=args.stall_budget)
     dep = Deployment(spec, load_hosts(args.hosts), fabric)
     servers = start(dep, args.control)
     print(f"KAIROS MAS: {len(spec.agents)} agents, {len(spec.clusters)} clusters; "

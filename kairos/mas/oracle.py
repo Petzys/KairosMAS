@@ -293,12 +293,18 @@ class MASJudge(LLMJudge):
         self.context_requests: list[list[str]] = []
         self._view: LineageView | None = None
         self._allow_request = True
+        self._closing = ""            # set for the last round: why no more context is coming
 
     def evaluate(self, user_prompt: str, branch: Branch) -> Verdict:
+        """Ask for a verdict; serve context requests while rounds remain. A request
+        that cannot be served (an agent outside the lineage, rounds used up) gets one
+        more round that demands a verdict; a model that still will not decide fails
+        closed -- never with a request misread as a verdict."""
         self._view = build_lineage(self.monitor, gated_values(branch))
+        self._closing = ""
         rounds = 0
         while True:
-            self._allow_request = rounds < self.max_context_rounds
+            self._allow_request = not self._closing and rounds < self.max_context_rounds
             prompt = self._build_prompt(user_prompt, branch)
             kwargs: dict[str, Any] = {}
             if not is_reasoning_model(self.model):
@@ -313,12 +319,25 @@ class MASJudge(LLMJudge):
             except Exception as e:                     # model/transport failure → fail closed
                 return Verdict(consistent=False, rationale=f"judge unavailable ({e}); failing closed")
             wanted = _context_request(raw)
-            if wanted is not None and self._allow_request:
+            if wanted is not None:
                 self.context_requests.append(wanted)
-                rounds += 1
-                if expand_lineage(self._view, self.monitor, wanted):
+                if self._allow_request:
+                    rounds += 1
+                    if expand_lineage(self._view, self.monitor, wanted):
+                        continue
+                    self._closing = (f"the traces of {', '.join(wanted)} are not part of this "
+                                     "lineage and cannot be provided")
                     continue
+                if not self._closing:
+                    self._closing = "no further context can be provided"
+                    continue
+                v = Verdict(consistent=False, raw=raw,
+                            rationale="the oracle requested context instead of deciding; failing closed")
+                _annotate(v, resp)
+                return v
             verdict = self._parse(raw)
+            if not verdict.per_action and not verdict.consistent:
+                verdict.rationale = "no verdict for the pending actions; failing closed"
             _annotate(verdict, resp)
             return verdict
 
@@ -329,6 +348,9 @@ class MASJudge(LLMJudge):
             head, tail = base, ""
         view = self._view or build_lineage(self.monitor, gated_values(branch))
         mas = render_lineage(view, self.monitor, allow_request=self._allow_request)
+        if self._closing:
+            mas.append(f"\nNo further context can be given ({self._closing}). Do NOT request "
+                       "context again: respond now with the JSON verdict for the pending actions.")
         return head + "\n".join(mas) + (_FINAL_LINE + tail if sep else "")
 
 

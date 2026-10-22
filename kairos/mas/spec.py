@@ -30,7 +30,8 @@ from kairos.policy.schema import (
 # Pseudo-actions under which inter-agent messages are matched by cluster rules.
 A2A_SEND = "a2a.send"       # a request to another agent
 A2A_REPLY = "a2a.reply"     # content returned to a requester
-A2A_ACTIONS = (A2A_SEND, A2A_REPLY)
+A2A_EXTERNAL = "a2a.external"   # content for a party outside the system
+A2A_ACTIONS = (A2A_SEND, A2A_REPLY, A2A_EXTERNAL)
 
 
 @dataclass(slots=True)

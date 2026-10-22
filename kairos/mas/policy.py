@@ -16,7 +16,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,12 +39,13 @@ from kairos.policy.schema import ContactBook as ContactBookSchema
 
 class PeerContactBook(ContactBook):
     """Destinations inside the system: the A2A endpoints the sending cluster lists,
-    with their clearance, plus the requesters this agent currently answers.
+    with their clearance -- and, while its reply is being decided, the requester.
 
-    A requester is KNOWN for its reply (it addressed this agent) but has no
-    clearance unless the book lists it: a reply carrying sensitive data to an
-    uncleared requester is still reviewed. Identifiers the cluster's external book
-    knows (a contact's address in a message body) count as known too."""
+    A requester is KNOWN for the reply it asked for (the request established that
+    edge) but for nothing else, and it has no clearance unless the book lists it: a
+    reply carrying sensitive data to an uncleared requester is still reviewed, and a
+    NEW request to it is judged like any other. Identifiers the cluster's external
+    book knows (a contact's address in a message body) count as known too."""
 
     def __init__(self, peers: Iterable[tuple[str, Level]], *, on_miss: Decision,
                  external: ContactBook | None = None) -> None:
@@ -51,10 +53,17 @@ class PeerContactBook(ContactBook):
             lookup_fields=[], on_miss=on_miss,
             entries=[CbEntry(match=origin, max_level=level) for origin, level in peers]))
         self._external = external
-        self._reply_targets: set[str] = set()
+        self._answering: str | None = None
 
-    def add_reply_target(self, endpoint: str) -> None:
-        self._reply_targets.add(normalize(endpoint_origin(endpoint)))
+    @contextmanager
+    def answering(self, endpoint: str) -> Iterator[None]:
+        """Scope in which `endpoint` is known: the decision about a reply to it.
+        Decisions run under the deciding agent's lock, so the scope is not shared."""
+        prev, self._answering = self._answering, normalize(endpoint_origin(endpoint))
+        try:
+            yield
+        finally:
+            self._answering = prev
 
     def lookup(self, value: str, strategy: Strategy = Strategy.NORMALIZED) -> CbEntry | None:
         e = super().lookup(value, strategy)
@@ -63,7 +72,8 @@ class PeerContactBook(ContactBook):
         return e
 
     def is_known(self, value: str, strategy: Strategy = Strategy.NORMALIZED) -> bool:
-        if super().is_known(value, strategy) or normalize(value) in self._reply_targets:
+        if super().is_known(value, strategy) or (self._answering is not None
+                                                 and normalize(value) == self._answering):
             return True
         return self._external is not None and self._external.is_known(value, strategy)
 
@@ -144,7 +154,11 @@ def evaluate_message(spec: MASSpec, engines: AgentEngines, sender: str, dest: st
         return StageResult(Decision.DENY, stage=1, produced_by="topology",
                            reason=f"agent {dest!r} (cluster {spec.agents[dest].cluster!r}) is not "
                                   f"in the contact book of cluster {spec.agents[sender].cluster!r}")
-    return engines.messages.evaluate(message_event(spec, sender, dest, text, data, reply=reply))
+    event = message_event(spec, sender, dest, text, data, reply=reply)
+    if reply:
+        with engines.peers.answering(spec.agents[dest].endpoint):
+            return engines.messages.evaluate(event)
+    return engines.messages.evaluate(event)
 
 
 def annotate_intra_cluster(spec: MASSpec, engines: AgentEngines, sender: str, dest: str, text: str,

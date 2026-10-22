@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from kairos.core.events import Event
+from kairos.core.events import Channel, Event, HttpMethod
 from kairos.core.extract import embedded_values
 from kairos.core.store import LabelSnapshot, TokenStore
 from kairos.engine.decision import Decision, StageResult
@@ -46,7 +46,7 @@ from kairos.mas.causal import AgentClock, CausalEvent, CausalLog, EventId, Event
 from kairos.mas.policy import (
     annotate_intra_cluster, build_engines, evaluate_message, message_event,
 )
-from kairos.mas.spec import A2A_REPLY, A2A_SEND, MASSpec
+from kairos.mas.spec import A2A_EXTERNAL, A2A_REPLY, A2A_SEND, MASSpec
 from kairos.monitor import ReferenceMonitor, SessionResult
 from kairos.speculative.branch import Branch, HeldAction
 from kairos.speculative.effects import EffectKind, State
@@ -93,6 +93,9 @@ class MessageRecord:
     send_event: EventId | None = None
     send_clock: VectorClock | None = None
     labels: LabelSnapshot | None = None
+    # sha256 of the canonical bytes released under this id: the id is a single-use
+    # capability for exactly that content (checked where it is consumed)
+    digest: str | None = None
     created: float = field(default_factory=time.monotonic)
     released_at: float | None = None
     # set by the enforcement point while the message is held
@@ -512,6 +515,47 @@ class AgentMonitor(ReferenceMonitor):
         self.session.calls.append({"tool": A2A_REPLY if record.reply else A2A_SEND,
                                    "decision": "ALLOW", "args": args, "result": result})
 
+    # --- parties outside the system -----------------------------------------
+    def decide_external(self, url: str, text: str, data: list[dict[str, Any]] | None = None) -> tuple[bool, str]:
+        """Content leaving the system for a party the spec does not list: an A2A
+        request to an outside endpoint, or a reply to an unidentified requester. An
+        external, irreversible effect with blocking semantics: an open branch is
+        resolved first, then the effect is decided on its own (policy, then the
+        oracle on REVIEW). Returns (release?, notice)."""
+        with self.lock:
+            self._await_lineage()
+            content: dict[str, Any] = {"message": text}
+            if data:
+                content["data"] = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            ev = Event(time.time(), Channel.NET, HttpMethod.POST.value, self.agent_id, url, content,
+                       {"function": A2A_EXTERNAL})
+            if self.machine.state is State.BRANCH:
+                view = self.event_view(ev, call_ref=None, decision=self.engine.evaluate(ev))
+                r = self.resolve("BLOCKING_EFFECT", pending=view)
+                if r is not None and r[2].aborted:
+                    return False, notices.recompose(url)
+            stage = self.gate(ev)
+            if stage.decision is Decision.DENY:
+                return False, notices.message_rejected(url, stage.reason or stage.produced_by)
+            if stage.decision is Decision.ALLOW:
+                return True, ""
+            ok, verdict = self.adjudicate_effect(self.event_view(ev, call_ref=None, decision=stage), (),
+                                                 mode="sync_external")
+            return ok, "" if ok else notices.message_rejected(url, verdict.rationale)
+
+    def on_external_inbound(self, text: str, source: str = "a2a.external") -> CausalEvent:
+        """A request from a party that is neither a monitored agent nor the principal
+        reached this agent: untrusted content, recorded like a received message (it
+        carries no labels and no causal past the monitor knows)."""
+        with self.lock:
+            self.store.record_text(text, source)
+            ev = self.record_event(EventKind.RECV, {"from": source, "reply": False, "intra": False,
+                                                    "text": _clip(text, 1500)})
+            self.session.calls.append({"tool": RECV_TOOL, "decision": "ALLOW",
+                                       "args": {"from": source, "kind": "request"}, "result": _clip(text)})
+            self.session.record_untrusted(RECV_TOOL, text[:2000])
+            return ev
+
     # --- the inter-agent channel: inbound -----------------------------------
     def on_receive(self, record: MessageRecord) -> CausalEvent:
         """A message delivered to this agent. Its sender's labels join this agent's
@@ -526,8 +570,6 @@ class AgentMonitor(ReferenceMonitor):
                 "from": record.sender, "reply": record.reply, "intra": record.intra,
                 "text": _clip(record.content, 1500)},
                 msg_id=record.kmid, after=record.send_event, merge=record.send_clock)
-            if not record.reply:
-                self.engines.peers.add_reply_target(self.spec.agents[record.sender].endpoint)
             self._heard_from.setdefault(record.sender, []).append(record.content.lower())
             self.session.calls.append({"tool": RECV_TOOL, "decision": "ALLOW",
                                        "args": {"from": record.sender,
