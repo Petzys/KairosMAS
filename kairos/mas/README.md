@@ -242,6 +242,16 @@ value-free injections such as a password change still pass (ASR banking 15.3, wo
 16.7 / 13.3, travel 15.0): the residual the single-agent paper names, now with more
 decisions per task.
 
+**Speed** (benign, domain layout, 50 ms per tool call, mean wall time per task): the
+monitor adds little to sequential hand-offs (banking 105 → 107 ms, slack 234 → 238 ms)
+and keeps the speedup of parallel ones (`--dispatch parallel`: banking 62 → 73 ms, slack
+146 → 159 ms, the difference being streamed hand-offs held until the front desk awaits
+them). A held stream may land after concurrent work: in slack, inviting a user (held: a
+new e-mail address) and messaging her (released) ran in the wrong order in 2 of 21
+tasks. Steps that depend on each other belong in blocking sends or one cluster — the
+design hint of the notes. Parallel dispatch is timing-dependent; `sync` and `stream` are
+deterministic.
+
 Reading the table:
 * With an ideal oracle the system loses **no** utility and lets **no** injected effect
   through, in every layout: the mechanics (holds, releases, re-issues, lineage) are sound.
