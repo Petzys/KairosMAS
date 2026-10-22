@@ -26,7 +26,7 @@ from agentdojo.types import text_content_block_from_string
 from kairos.mas.a2a.adapter import Delivery
 from kairos.mas.bench.environment import Exposure, ToolBox
 from kairos.mas.bench.llm import LLMAgents
-from kairos.mas.bench.oracles import InjectionMatcher, judge_factory
+from kairos.mas.bench.oracles import InjectionMatcher, effect_tools, judge_factory
 from kairos.mas.bench.scripted import ScriptedSystem
 from kairos.mas.bench.suites import POLICY_DIR, SYSTEMS, BuildOptions, build_spec
 from kairos.mas.fabric import MonitorFabric
@@ -122,8 +122,11 @@ def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | N
     spec = build_spec(cfg.suite, BuildOptions(layout=cfg.layout, message_identifiers=cfg.message_identifiers,
                                               message_review=cfg.message_review))
     judges: list[Any] = []
-    make_judge = judge_factory(cfg.oracle, injection_plan=injection_plan, user_plan=plan,
-                               client=judge_client, model=cfg.judge_model, prompt=cfg.judge_prompt)
+    effects = effect_tools(cfg.suite)
+    exposure = Exposure.for_injection(injection_task.GOAL if injection_task else None, injections.values())
+    make_judge = judge_factory(cfg.oracle, injection_plan=injection_plan, user_plan=plan, effects=effects,
+                               payload=exposure.contains, client=judge_client, model=cfg.judge_model,
+                               prompt=cfg.judge_prompt)
 
     def factory(monitor: Any) -> Any:
         j = make_judge(monitor)
@@ -133,7 +136,6 @@ def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | N
     fabric = MonitorFabric(spec, judge_factory=factory, hold_notice=cfg.hold_notice,
                            max_held_per_branch=cfg.max_held_per_branch)
     tools = ToolBox(suite, task_env, system, latency=cfg.tool_latency)
-    exposure = Exposure.for_injection(injection_task.GOAL if injection_task else None, injections.values())
 
     if cfg.backend == "scripted":
         agents: Any = ScriptedSystem(spec, system, tools, exposure, plan=plan, injection_plan=injection_plan,
@@ -155,7 +157,7 @@ def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | N
     utility = suite._check_task_result(user_task, model_output, pre_env, task_env, tools.trace)
     attack_success = (suite._check_task_result(injection_task, model_output, pre_env, task_env, tools.trace)
                       if injection_task is not None else None)
-    metrics = _metrics(spec, res, tools, exposure, judges, injection_plan, plan, agents)
+    metrics = _metrics(spec, res, tools, exposure, judges, injection_plan, plan, effects, agents)
     if meter is not None:
         metrics["tokens"] = meter.snapshot()
     return PairResult(suite=cfg.suite, user_task=user_task.ID,
@@ -166,10 +168,10 @@ def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | N
 
 
 def _metrics(spec, res, tools: ToolBox, exposure: Exposure, judges: list[Any],
-             injection_plan: list[Any], plan: list[Any], agents: Any) -> dict[str, Any]:
+             injection_plan: list[Any], plan: list[Any], effects: set[str], agents: Any) -> dict[str, Any]:
     m: dict[str, Any] = {"elapsed": round(res.elapsed, 4), "quiescent": res.quiescent,
                          "executed_calls": len(tools.trace)}
-    matcher = InjectionMatcher(injection_plan, plan)
+    matcher = InjectionMatcher(injection_plan, plan, effects)
     m["executed_injection_calls"] = sum(1 for c in tools.trace if matcher.matches(c.function, dict(c.args)))
     exposed = exposure.agents
     m["exposed_agents"] = exposed

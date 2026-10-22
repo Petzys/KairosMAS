@@ -127,6 +127,13 @@ class ScriptedSystem:
                 steps.append(Step(False, f"no agent can run {calls[0].function}"))
         for owner, r in started:
             res = host.client.wait_task(r.task_id, timeout=120) if r.task_id and not r.state.is_final else r
+            if res.state in (TaskState.FAILED, TaskState.REJECTED):
+                self._collect(host, owner, res)
+                with self._lock:
+                    self.retries += 1
+                calls = groups[owner]
+                text = "Please run: " + "; ".join(f"{c.function}({dict(c.args)})" for c in calls)
+                res = host.client.send_message(host.url_of(owner), text, [call_data(c) for c in calls])
             steps.append(self._collect(host, owner, res))
         return steps
 
