@@ -15,6 +15,7 @@ contradicted is re-entered once.
 """
 from __future__ import annotations
 
+import threading
 from ast import literal_eval
 from collections.abc import Callable
 from typing import Any
@@ -26,7 +27,7 @@ from agentdojo.types import (
     text_content_block_from_string,
 )
 
-from kairos.mas.a2a.protocol import Message
+from kairos.mas.a2a.protocol import Message, TaskState
 from kairos.mas.a2a.server import AgentResult
 from kairos.mas.bench.environment import Exposure, ToolBox
 from kairos.mas.bench.suites import ENTRY, SuiteSystem, reachable
@@ -88,7 +89,7 @@ def system_prompt(spec: MASSpec, agent: str) -> str:
 class LLMAgents:
     def __init__(self, spec: MASSpec, system: SuiteSystem, tools: ToolBox, exposure: Exposure, *,
                  llm_factory: Callable[[], Any], max_iters: int = 15, task_timeout: float = 300.0,
-                 verbose: bool = False) -> None:
+                 max_tasks: int = 40, verbose: bool = False) -> None:
         self.spec = spec
         self.system = system
         self.tools = tools
@@ -96,6 +97,10 @@ class LLMAgents:
         self.llm_factory = llm_factory
         self.max_iters = max_iters
         self.task_timeout = task_timeout
+        # agents may delegate back and forth; bound the tasks one session may start
+        self.max_tasks = max_tasks
+        self.tasks_started = 0
+        self._lock = threading.Lock()
         self.verbose = verbose
         self.transcripts: list[dict[str, Any]] = []
 
@@ -104,6 +109,11 @@ class LLMAgents:
 
     def _run(self, host: AgentHost, msg: Message, task_id: str) -> AgentResult:
         agent = host.agent_id
+        with self._lock:
+            self.tasks_started += 1
+            if self.tasks_started > self.max_tasks:
+                return AgentResult(text="Task refused: this session's task budget is exhausted.",
+                                   state=TaskState.FAILED)
         runtime = FunctionsRuntime([*self.tools.functions_for(agent), *MESSAGING.values()])
         incoming = msg.content_text()
         self.exposure.see(agent, incoming, "message" if agent != ENTRY else "prompt")

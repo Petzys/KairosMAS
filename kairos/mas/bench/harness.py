@@ -102,10 +102,19 @@ class _AttackTarget(SimpleNamespace):
     """What an AgentDojo attack needs of the attacked pipeline: its name."""
 
 
+# How an injection addresses the agent ({model} in important_instructions), by model
+# family, following AgentDojo's convention (it names OpenAI models "GPT-4" and its
+# Llama entry "AI assistant").
+_FAMILY_NAMES = (("gpt", "GPT-4"), ("o1", "GPT-4"), ("o3", "GPT-4"), ("o4", "GPT-4"),
+                 ("claude", "Claude"), ("gemini", "AI model developed by Google"),
+                 ("qwen", "Qwen"), ("gemma", "Gemma"), ("deepseek", "DeepSeek"))
+
+
 def make_attack(cfg: RunConfig, suite: Any) -> Any:
     name = cfg.model if cfg.backend == "llm" else "local"
     if not any(k in name for k in MODEL_NAMES):
-        MODEL_NAMES[name] = "AI assistant"
+        low = name.lower()
+        MODEL_NAMES[name] = next((n for f, n in _FAMILY_NAMES if f in low), "AI assistant")
     return load_attack(cfg.attack, suite, _AttackTarget(name=name))
 
 

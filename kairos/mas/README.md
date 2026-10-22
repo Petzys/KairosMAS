@@ -186,6 +186,9 @@ counts). Agent labels are cut out of the suite's single-agent policy
   rejected messages, **exposure** (agents and clusters that read the payload), where
   injected effects were stopped (cluster vs external boundary), elapsed time, tokens.
 
+`evaluation/mas/run_masdojo.sh scripted|llm [--go]` prints (and with `--go` runs) the
+complete scripted and LLM run sets.
+
 ```bash
 # deterministic grid, no API key (minutes):
 .venv/bin/python scripts/run_mas_benchmark.py --suite all --layout one domain singleton
@@ -231,6 +234,13 @@ Containment against utility (`--oracle gt-contain`, domain layout): exposure dro
 1.03 / 1.05 / 1.03 / 1.58 clusters (banking / slack / workspace / travel) with ASR still
 0.0, but utility under attack falls to 87.5 / 76.2 / 42.5 / 57.9 — the payload sits in
 content the task needs, and a message is committed or withheld as a whole.
+
+With the single-agent **structural** oracle (`--oracle deterministic`, no LLM; one /
+domain layout) utility drops where tasks legitimately use content-derived identifiers
+(banking 87.5 / 75.0, slack 19.0 / 19.0, workspace 82.5 / 27.5, travel 100 / 75.0) and
+value-free injections such as a password change still pass (ASR banking 15.3, workspace
+16.7 / 13.3, travel 15.0): the residual the single-agent paper names, now with more
+decisions per task.
 
 Reading the table:
 * With an ideal oracle the system loses **no** utility and lets **no** injected effect
