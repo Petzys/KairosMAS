@@ -90,9 +90,9 @@ def test_egress_as_explicit_proxy() -> None:
             ingress[endpoint_origin(ag.endpoint)] = _serve(ingress_app(ep), servers)
             egress[a] = _serve(egress_app(ep), servers)
         proxied = httpx.Client(proxy=egress["assistant"], timeout=20)
-        client = A2AClient(lambda url, body: proxied.post(url, content=body,
-                                                          headers={"content-type": "application/json"}).content,
-                           lambda url, body: None)
+        client = A2AClient(lambda url, body, h: proxied.post(url, content=body, headers={
+                               **h, "content-type": "application/json"}).content,
+                           lambda url, body, h: None)
         r = client.send_message(spec.agents["documents"].endpoint, "read the bill")
         assert r.state is TaskState.COMPLETED and r.text == "hello from documents"
         assert fabric.report()["counts"]["messages"] == 2           # request and reply, both monitored

@@ -39,7 +39,7 @@ benign work keeps running in parallel and only what has to be decided is decided
 | [`fabric.py`](fabric.py) | DPs, message registry, lineage queries across DPs, downstream notices |
 | [`enforcement.py`](enforcement.py) | `EnforcementPoint`: tool path, A2A client side, A2A server side |
 | [`oracle.py`](oracle.py) | Lineage-aware oracle (`MASJudge`), context on request |
-| [`a2a/`](a2a) | A2A wire types, protocol adapter, minimal server/client, HTTP sidecars |
+| [`a2a/`](a2a) | A2A v1.0 wire types, protocol adapter, minimal server/client, HTTP sidecars |
 | [`transport.py`](transport.py), [`runtime.py`](runtime.py) | Network abstraction, in-process hosts and session driver |
 | [`serve.py`](serve.py) | Deployment entry point in front of real A2A agents |
 | [`bench/`](bench) | **MASDojo**, the system-level benchmark (below) |
@@ -80,16 +80,16 @@ oracle on REVIEW.
 
 | A2A | KAIROS effect | Behaviour |
 |---|---|---|
-| `SendMessage` (`message/send`) | **blocking** | an open branch is resolved first (trigger `BLOCKING_EFFECT`), then the message is decided on its own, synchronously — the oracle sees only the prefix |
-| `SendStreamingMessage` (`message/stream`, `message/send` with `blocking: false`) | **stallable** | held in the sender's speculative scope; the sender sees the native A2A `working` state; released or dropped at the sender's next trigger — the oracle sees later evidence |
+| `SendMessage` | **blocking** | an open branch is resolved first (trigger `BLOCKING_EFFECT`), then the message is decided on its own, synchronously — the oracle sees only the prefix |
+| `SendStreamingMessage`, `SendMessage` with `configuration.returnImmediately` | **stallable** | held in the sender's speculative scope; the sender sees the native A2A `TASK_STATE_WORKING`; released or dropped at the sender's next trigger — the oracle sees later evidence |
 
 Triggers that release a held message: the sender finishes its task (TERMINAL), a further
 held effect (NESTED_REVIEW), a stub flowing into a new call, a re-issue (LOOP, honest
 mode), a blocking send (BLOCKING_EFFECT), the sender **polling the held task**
-(`tasks/get`/resubscribe → AWAIT, a dependency on the held effect), and the stall budget
-(BUDGET, also checked by a watchdog for a quiet agent). Denial: the message is dropped,
-the sender sees `rejected` plus a KAIROS-style notice; the agent's context is not rolled
-back.
+(`GetTask` / `SubscribeToTask` → AWAIT, a dependency on the held effect), and the stall
+budget (BUDGET, also checked by a watchdog for a quiet agent). Denial: the message is
+dropped, the sender sees `TASK_STATE_REJECTED` plus a KAIROS-style notice; the agent's
+context is not rolled back.
 
 ### Resolution and the oracle (§3.4)
 * Resolution is always **per agent**; the oracle only decides about that agent's held
@@ -134,14 +134,51 @@ past has arrived.
 
 ### A2A and other protocols (Implementation)
 `a2a/adapter.py` is the protocol seam: the monitor reasons over `InterAgentMessage`s
-(REQUEST blocking/streaming, REPLY, POLL) and the adapter renders the two answers the
-monitor gives itself (`working`, `rejected`). Another protocol needs only another adapter.
-Both A2A JSON-RPC namings are accepted (`message/send` and `SendMessage`, …).
+(REQUEST blocking/streaming, REPLY, POLL, CONTROL) and the adapter renders the two
+answers the monitor gives itself (`working`, `rejected`) and the canonical form of what
+it checked, which is what leaves. Another protocol needs only another adapter.
+
+The prototype speaks **A2A v1.0** (specification release 1.0.1, JSON-RPC binding,
+normative `a2a.proto` package `lf.a2a.v1`) and nothing else:
+
+* methods `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`,
+  `SubscribeToTask` (plus the push-config methods and `GetExtendedAgentCard`, which are
+  answered with their errors); ProtoJSON payloads: `TASK_STATE_*` / `ROLE_*` enum
+  names, parts without a `kind` tag (exactly one of `text` / `raw` / `url` / `data`),
+  `SendMessageResponse` / `StreamResponse` oneof wrappers (`{"task": …}`,
+  `{"statusUpdate": …}`, …), `GetTask` / `CancelTask` answering with the bare Task, no
+  `final` flag (a stream closes at a terminal state), `returnImmediately` instead of
+  `blocking`, errors with a `google.rpc.ErrorInfo` detail;
+* every request carries the `A2A-Version: 1.0` service parameter (an HTTP header). A
+  request without it means 0.3; the EP answers it, and any version other than 1.0,
+  with `VersionNotSupportedError` (-32009) before anything is decided or forwarded. A
+  0.3-shaped reply (kind tags, lowercase states) is not a v1.0 response: it is withheld,
+  fail closed. Accepting both versions would put two parsers at the security boundary;
+  a 0.3 agent stack needs a translating adapter in front of its EP;
+* the EP answers itself what it does not relay: `ListTasks` (the tasks the agent
+  started at that peer, under their local ids), push notifications (-32003: a webhook
+  delivers to a URL of the agent's choosing, a channel past the ingress) and the
+  extended card (-32007). `SubscribeToTask` on a finished task is refused (-32004), as
+  the specification requires;
+* ids are content too: only ids the peer itself issued leave with a request. A task
+  the agent streams or starts with `returnImmediately` keeps one task id and one
+  context id for its whole life (the EP's; the peer's are mapped on the way out, and
+  learned only from the peer's own events). A message continuing a task must name one
+  the agent knows at that peer (else TaskNotFoundError, answered locally, §3.4.2); a
+  context the agent names that the peer did not issue stays the agent's view and never
+  leaves (§3.4.1: preserved, not silently replaced). The reference agent server
+  continues only tasks waiting for input (§3.1.1: a finished task takes no further
+  messages).
+
 For HTTP deployments (`a2a/http.py`, `serve.py`) the EP is a sidecar with an **ingress**
 listener (the agent's public endpoint) and an **egress** listener (where the agent's
 outbound traffic is redirected — the target is rebuilt from the `Host` header like a
-transparent proxy — or configured as its HTTP proxy). Monitor message ids travel between
-hosts as `x-kairos-*` headers (SSE comment lines on streams).
+transparent proxy — or configured as its HTTP proxy). The A2A service parameters travel
+as HTTP headers; monitor message ids travel between hosts as `x-kairos-*` headers (SSE
+comment lines on streams) and are never taken from the agent at the egress. The ingress
+publishes the agent card (`/.well-known/agent-card.json`, `supportedInterfaces` with the
+public endpoint) from the system spec, never the agent's own card: discovery would be a
+channel the monitor does not check.
 
 ## Decisions on open questions
 
@@ -155,6 +192,8 @@ hosts as `x-kairos-*` headers (SSE comment lines on streams).
 | Infection inside a cluster | Not prevented (per the notes), but when a held effect is withheld, receivers of messages its agent sent while the effect was pending get a notice that it never happened. |
 | `peers.on_miss` default | REVIEW (like the external contact book); MASDojo uses DENY (star topology). |
 | Monitor message ids | Minted by the monitor (`kmid`), never chosen by agents; travel out of band. |
+| A2A version | v1.0 only (release 1.0.1, JSON-RPC binding); other versions are refused with -32009 at the EP rather than translated: one parser at the boundary. |
+| A2A push notifications | Not offered (-32003): the peer would deliver to a webhook of the agent's choosing, past the ingress. Streams and polls cover the same need. |
 | Oracle prompt | The frozen single-agent benchmark prompt plus a multi-agent addendum (`MAS_SYSTEM`); `prompt="production"` uses the intent-first production prompt. |
 
 ## MASDojo — the benchmark
@@ -280,7 +319,7 @@ Reading the table:
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests -k mas      # 130+ tests, a few seconds, no API key
+.venv/bin/python -m pytest tests -k mas      # 210+ tests, a few seconds, no API key
 ```
 
 Unit tests for every layer (`test_mas_causal`, `_a2a`, `_spec`, `_labels`, `_policy`,

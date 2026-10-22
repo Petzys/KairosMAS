@@ -122,13 +122,13 @@ class Deployment:
                 ep.reset()
             entry = self.spec.entry
             principal = {PRINCIPAL_HEADER: self.fabric.principal_token}
-            client = A2AClient(lambda url, body: self.network.request(url, body, principal)[0],
-                               lambda url, body: self.network.stream(url, body, principal))
+            client = A2AClient(lambda url, body, h: self.network.request(url, body, {**h, **principal})[0],
+                               lambda url, body, h: self.network.stream(url, body, {**h, **principal}))
             r = client.send_message(self.spec.agents[entry].endpoint, prompt)
             deadline = time.monotonic() + 60
             for ep in self.eps.values():
                 ep.join(timeout=max(0.0, deadline - time.monotonic()))
-            return {"state": r.state.value, "answer": r.text or r.notice, "report": self.fabric.report()}
+            return {"state": r.state.short, "answer": r.text or r.notice, "report": self.fabric.report()}
 
     def control_app(self) -> Starlette:
         def session(request: HttpRequest) -> JSONResponse:

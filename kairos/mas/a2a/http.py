@@ -1,4 +1,4 @@
-"""A2A over HTTP, and the enforcement point as a sidecar proxy.
+"""A2A v1.0 over HTTP (JSON-RPC binding), and the enforcement point as a sidecar proxy.
 
 An agent host in a deployment has three HTTP listeners:
 
@@ -10,11 +10,17 @@ An agent host in a deployment has three HTTP listeners:
            transparent HTTP proxy does) or configured as the agent's HTTP proxy
            (absolute-form request target). The enforcement point's client side.
 
-The agent is unmodified: it serves A2A and sends A2A. The monitor's message ids
-travel between ingress and egress listeners as HTTP headers (x-kairos-*); on a
-stream they ride as SSE comment lines, which SSE clients ignore. Hosts trust each
-other's listeners (they are the TCB); authenticating them (e.g. mTLS between
-hosts) is a deployment concern outside this module.
+The agent is unmodified: it serves A2A and sends A2A. The A2A service parameters
+(A2A-Version, A2A-Extensions) travel as HTTP headers, as the binding specifies; the
+monitor's message ids travel between ingress and egress listeners as HTTP headers
+too (x-kairos-*), and on a stream as SSE comment lines, which SSE clients ignore.
+Only an ingress reads x-kairos-* headers, and only from the network: the egress
+never takes them from the agent. Hosts trust each other's listeners (they are the
+TCB); authenticating them (e.g. mTLS between hosts) is a deployment concern outside
+this module.
+
+The ingress publishes the agent's card from the system spec. The agent's own card
+is content the monitor has not checked; discovery must not become a channel past it.
 
 All endpoints are synchronous (Starlette runs them in its thread pool): an
 enforcement decision may block on the oracle, and a stalled message must not stall
@@ -33,23 +39,29 @@ from starlette.requests import Request as HttpRequest
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from kairos.mas.a2a.protocol import Method, ProtocolError, parse_request
+from kairos.mas.a2a.protocol import AgentCard, ProtocolError, parse_request, version_headers
 from kairos.mas.a2a.server import A2AServer
 from kairos.mas.transport import EventStream, Headers
 
 MONITOR_PREFIX = "x-kairos-"
+SERVICE_PREFIX = "a2a-"          # A2A service parameters: A2A-Version, A2A-Extensions
+JSON = "application/json"
 SSE = "text/event-stream"
 
 
 def _is_streaming(body: bytes) -> bool:
     try:
-        return parse_request(body).method in (Method.STREAM, Method.RESUBSCRIBE)
+        return parse_request(body).method.streams
     except ProtocolError:
         return False
 
 
 def _monitor_headers(headers: Any) -> Headers:
     return {k.lower(): v for k, v in headers.items() if k.lower().startswith(MONITOR_PREFIX)}
+
+
+def _service_headers(headers: Any) -> Headers:
+    return {k.lower(): v for k, v in headers.items() if k.lower().startswith(SERVICE_PREFIX)}
 
 
 def sse_encode(body: bytes, headers: Headers | None = None) -> bytes:
@@ -89,9 +101,10 @@ def agent_app(server: A2AServer, path: str = "/a2a") -> Starlette:
 
     def rpc(request: HttpRequest) -> Response:
         body = read_body(request)
+        hdrs = _service_headers(request.headers)
         if _is_streaming(body):
-            return _stream_response(server.handle_stream(body), monitor=False)
-        return Response(server.handle(body), media_type="application/json")
+            return _stream_response(server.handle_stream(body, hdrs), monitor=False)
+        return Response(server.handle(body, hdrs), media_type=JSON)
 
     def card(_request: HttpRequest) -> Response:
         return JSONResponse(server.card.to_dict())
@@ -121,8 +134,7 @@ class HttpNetwork:
 
     def request(self, url: str, body: bytes, headers: Headers) -> tuple[bytes, Headers]:
         target = self.resolve(url)
-        r = self._client(target).post(target, content=body,
-                                      headers={**headers, "content-type": "application/json"})
+        r = self._client(target).post(target, content=body, headers={**headers, "content-type": JSON})
         return r.content, _monitor_headers(r.headers)
 
     def stream(self, url: str, body: bytes, headers: Headers) -> EventStream:
@@ -135,8 +147,7 @@ class HttpNetwork:
         def pump() -> None:
             try:
                 with client.stream("POST", target, content=body,
-                                   headers={**headers, "content-type": "application/json",
-                                            "accept": SSE}) as r:
+                                   headers={**headers, "content-type": JSON, "accept": SSE}) as r:
                     ready.set()
                     for ev, hdrs in sse_events(r.iter_lines()):
                         out.put(ev, hdrs)
@@ -160,11 +171,11 @@ class HttpAgentServer:
         self.url = url
         self._net = HttpNetwork(client=client, timeout=timeout)
 
-    def handle(self, body: bytes) -> bytes:
-        return self._net.request(self.url, body, {})[0]
+    def handle(self, body: bytes, headers: Headers | None = None) -> bytes:
+        return self._net.request(self.url, body, dict(headers) if headers is not None else version_headers())[0]
 
-    def handle_stream(self, body: bytes) -> EventStream:
-        return self._net.stream(self.url, body, {})
+    def handle_stream(self, body: bytes, headers: Headers | None = None) -> EventStream:
+        return self._net.stream(self.url, body, dict(headers) if headers is not None else version_headers())
 
 
 class HttpClientTransport:
@@ -179,18 +190,20 @@ class HttpClientTransport:
         u = httpx.URL(url)
         return self.egress + u.raw_path.decode(), {"host": u.netloc.decode()}
 
-    def send(self, url: str, body: bytes) -> bytes:
+    def send(self, url: str, body: bytes, headers: Headers | None = None) -> bytes:
         target, hdrs = self._req(url)
-        return self._client.post(target, content=body, headers={**hdrs, "content-type": "application/json"}).content
+        service = dict(headers) if headers is not None else version_headers()
+        return self._client.post(target, content=body, headers={**service, **hdrs, "content-type": JSON}).content
 
-    def send_stream(self, url: str, body: bytes) -> EventStream:
+    def send_stream(self, url: str, body: bytes, headers: Headers | None = None) -> EventStream:
         target, hdrs = self._req(url)
+        service = dict(headers) if headers is not None else version_headers()
         out = EventStream()
 
         def pump() -> None:
             try:
                 with self._client.stream("POST", target, content=body,
-                                         headers={**hdrs, "content-type": "application/json"}) as r:
+                                         headers={**service, **hdrs, "content-type": JSON, "accept": SSE}) as r:
                     for ev, _ in sse_events(r.iter_lines()):
                         out.put(ev)
             finally:
@@ -206,14 +219,16 @@ def ingress_app(ep: Any, path: str = "/a2a") -> Starlette:
 
     def rpc(request: HttpRequest) -> Response:
         body = read_body(request)
-        hdrs = _monitor_headers(request.headers)
+        hdrs = {**_service_headers(request.headers), **_monitor_headers(request.headers)}
         if _is_streaming(body):
             return _stream_response(ep.serve_stream(body, hdrs), monitor=True)
         resp, out = ep.serve(body, hdrs)
-        return Response(resp, media_type="application/json", headers=out)
+        return Response(resp, media_type=JSON, headers=out)
 
     def card(_request: HttpRequest) -> Response:
-        return JSONResponse(ep.server.card.to_dict()) if hasattr(ep.server, "card") else JSONResponse({})
+        agent = ep.spec.agents[ep.agent_id]
+        return JSONResponse(AgentCard(name=agent.id, url=agent.endpoint,
+                                      description=agent.description).to_dict())
 
     return Starlette(routes=[Route(path, rpc, methods=["POST"]),
                              Route("/.well-known/agent-card.json", card, methods=["GET"])])
@@ -235,9 +250,10 @@ def egress_app(ep: Any) -> Any:
             target = raw
         else:
             target = f"http://{request.headers.get('host', '')}{raw}"
+        hdrs = _service_headers(request.headers)          # never the agent's x-kairos-* headers
         if _is_streaming(body):
-            return _stream_response(ep.send_stream(target, body), monitor=False)
-        return Response(ep.send(target, body), media_type="application/json")
+            return _stream_response(ep.send_stream(target, body, hdrs), monitor=False)
+        return Response(ep.send(target, body, hdrs), media_type=JSON)
 
     inner = Starlette(routes=[Route("/{path:path}", forward, methods=["POST"])])
 

@@ -16,7 +16,7 @@ oracle -> commit), and adds the inter-agent channel:
         only the prefix);
       - STREAMING (SendStreamingMessage): a stallable effect, held in the agent's
         speculative scope and released at its next resolution trigger (the oracle
-        sees the later evidence); the sender sees the A2A 'working' state.
+        sees the later evidence); the sender sees TASK_STATE_WORKING.
   * a reply leaving the cluster is decided like a blocking message: the agent has
     finished, there is no later trigger to wait for.
 

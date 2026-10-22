@@ -3,9 +3,9 @@
 Every agent is a tool-calling LLM (AgentDojo's OpenAILLM element) with its own
 tools plus three A2A messaging tools:
 
-  send_message(agent, message)     message/send: wait for the agent's answer
-  delegate_task(agent, message)    message/stream: start a task, continue at once
-  get_task_result(task_id)         collect a delegated task (tasks/get, then wait)
+  send_message(agent, message)     SendMessage: wait for the agent's answer
+  delegate_task(agent, message)    SendStreamingMessage: start a task, continue at once
+  get_task_result(task_id)         collect a delegated task (GetTask, then wait)
 
 Each incoming A2A task starts a fresh conversation (local messaging: no shared
 history). The agent's tool calls cross its host's enforcement point exactly as in
@@ -182,7 +182,7 @@ class LLMAgents:
         r = host.client.start_task(url, text_out)
         if r.state.is_final:
             return r.render()
-        return (f"Task {r.task_id} started at agent '{peer}' (state: {r.state.value}). "
+        return (f"Task {r.task_id} started at agent '{peer}' (state: {r.state.short}). "
                 "Collect its answer with get_task_result.")
 
 

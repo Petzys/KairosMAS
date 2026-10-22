@@ -8,8 +8,9 @@ numbers what it sees (the agent's sequencer lives in the monitor), asks the
 cluster's decision point, and applies the answer: forward, block, stall, stub.
 
 Stalling a message uses the protocol's own states, so a caller only ever sees a
-delay: a streamed message on hold is a task in state 'working', a denied one is
-'rejected' with a notice.
+delay: a streamed message on hold is a task in TASK_STATE_WORKING, a denied one is
+TASK_STATE_REJECTED with a notice. A2A v1.0 only: a request for another protocol
+version is refused before anything is decided or forwarded.
 
 Three rules keep the channel honest against an adversarial agent:
   * forward exactly what was decided: requests and replies are re-serialized from
@@ -36,7 +37,8 @@ from kairos.mas import notices
 from kairos.mas.a2a.adapter import A2AAdapter, CommKind, Delivery, InterAgentMessage
 from kairos.mas.a2a.protocol import (
     Artifact, ArtifactUpdate, ErrorCode, Message, Method, Part, ProtocolError, Request, Response,
-    RpcError, StatusUpdate, Task, TaskState, TaskStatus, new_id, parse_request, parse_response,
+    RpcError, StatusUpdate, Task, TaskList, TaskState, TaskStatus, new_id, parse_request,
+    parse_response, rpc_id_of, version_error, version_headers, version_supported,
 )
 from kairos.mas.agent import AgentMonitor, MessageRecord, MsgStatus, Outcome
 from kairos.mas.fabric import MonitorFabric
@@ -67,8 +69,9 @@ class ToolOutcome:
 
 @dataclass(slots=True)
 class _LocalTask:
-    """A request the agent started without waiting for it (message/stream, or
-    message/send with blocking=false), under the id the agent knows."""
+    """A request the agent started without waiting for it (SendStreamingMessage, or
+    SendMessage with returnImmediately), under the ids the agent knows: its task and
+    context ids stay the same for the task's lifetime, whatever the peer issues."""
     id: str
     url: str
     request: InterAgentMessage
@@ -76,8 +79,9 @@ class _LocalTask:
     mode: str = "stream"                     # stream | poll
     peer: str | None = None                  # the destination agent (None: outside the system)
     remote_id: str | None = None             # the peer's id for the task
+    remote_context: str | None = None        # the peer's id for its context
     stream: EventStream = field(default_factory=EventStream)
-    mirrors: list[tuple[str, EventStream]] = field(default_factory=list)   # (alias id, stream)
+    mirrors: list[tuple[str, str, EventStream]] = field(default_factory=list)  # (task id, context id, stream)
     state: TaskState = TaskState.SUBMITTED
     texts: list[str] = field(default_factory=list)
     data: list[dict[str, Any]] = field(default_factory=list)
@@ -100,8 +104,11 @@ class EnforcementPoint:
         self.server: Any = None                       # the agent's A2A server (set by the host)
         self._tasks: dict[str, _LocalTask] = {}
         # ids a peer issued in its responses (task and context ids), with the monitor id
-        # of the request they answered: the only foreign ids forwarded back to it
+        # of the request they answered: the only foreign ids forwarded back to it.
+        # Keyed by peer: an agent of the system, or an outside endpoint's URL.
         self._peer_ids: dict[tuple[str, str], str | None] = {}
+        # contexts the agent named that the peer did not issue -> the peer's own
+        self._contexts: dict[tuple[str, str], str] = {}
         self._released_replies: dict[tuple[str, str | None, str], str] = {}
         self._lock = threading.RLock()
         self._threads: list[threading.Thread] = []
@@ -118,6 +125,7 @@ class EnforcementPoint:
         with self._lock:
             self._tasks.clear()
             self._peer_ids.clear()
+            self._contexts.clear()
             self._released_replies.clear()
             self._threads.clear()
 
@@ -216,30 +224,41 @@ class EnforcementPoint:
     # =====================================================================
     # A2A client side: the agent's requests to other agents
     # =====================================================================
-    def send(self, url: str, body: bytes) -> bytes:
-        """A blocking request (message/send), a non-blocking send, a poll or a control call."""
+    def send(self, url: str, body: bytes, headers: Headers | None = None) -> bytes:
+        """A blocking request (SendMessage), a non-blocking one (returnImmediately), a
+        poll or a control call. `headers` are the agent's A2A service parameters (None:
+        an in-process caller of this implementation)."""
+        if not version_supported(headers):
+            return version_error(rpc_id_of(body), headers)
         try:
             msg = self.adapter.parse_request(url, body)
         except ProtocolError as e:
-            return _error(None, ErrorCode.INVALID_REQUEST, str(e))
+            return _error(rpc_id_of(body), e.code, str(e))
+        if msg.kind is CommKind.UNSUPPORTED:
+            return self._unsupported(url, msg)
         if msg.kind in (CommKind.POLL, CommKind.CONTROL):
             return self._task_call(url, msg, body)
-        if msg.delivery is Delivery.STREAMING:             # message/send with blocking=false
-            local = self._start(url, msg, body, mode="poll")
-            return self._snapshot(local, msg).to_bytes()
         dest = self.spec.agent_at(url)
+        if self.defense and (refused := self._continuation_refused(msg, dest, url)) is not None:
+            return refused
+        if msg.delivery is Delivery.STREAMING:             # SendMessage with returnImmediately
+            local = self._start(url, msg, body, mode="poll")
+            return self._snapshot(local.alias_of or local, msg, view=local).to_bytes()
         if not self.defense:
             if dest is not None:
                 self._track_plain(dest, msg, reply=False, delivery=Delivery.BLOCKING)
             return self._forward(url, body)[0]
+        key = _peer_key(dest, url)
+        task_id, ctx = self._ids_for(msg, key)
+        canon = self.adapter.canonical_request(msg, task_id=task_id, context_id=ctx)
         if dest is None:
             ok, notice = self.monitor.decide_external(url, msg.text, msg.data)
             if not ok:
                 return self.adapter.rejected(msg, new_id("task-"), notice)
-            resp = self._forward(url, self._canonical(msg, None))[0]
+            resp = self._forward(url, canon)[0]
             self._external_inbound(resp, url)
-            return resp
-        canon = self._canonical(msg, dest)
+            self._learn_ids(key, resp, None)
+            return self._agent_view(resp, msg, (task_id, ctx), key)
         rec = self.fabric.new_message(self.agent_id, dest, msg.text, msg.data, delivery=Delivery.BLOCKING)
         rec.digest = digest(canon)
         d = self.monitor.decide_send(rec)
@@ -247,41 +266,135 @@ class EnforcementPoint:
             return self.adapter.rejected(msg, new_id("task-"), d.notice)
         resp, hdrs = self._forward(url, canon, rec)
         self._accept_reply(resp, hdrs)
-        self._learn_ids(dest, resp, rec.kmid)
-        return resp
+        self._learn_ids(key, resp, rec.kmid)
+        return self._agent_view(resp, msg, (task_id, ctx), key)
 
-    def send_stream(self, url: str, body: bytes) -> EventStream:
-        """A streaming request (message/stream) or a resubscription."""
+    def send_stream(self, url: str, body: bytes, headers: Headers | None = None) -> EventStream:
+        """A streaming request (SendStreamingMessage) or a subscription (SubscribeToTask)."""
+        if not version_supported(headers):
+            return _closed(version_error(rpc_id_of(body), headers))
         try:
             msg = self.adapter.parse_request(url, body)
         except ProtocolError as e:
-            return _closed(_error(None, ErrorCode.INVALID_REQUEST, str(e)))
+            return _closed(_error(rpc_id_of(body), e.code, str(e)))
         req = msg.raw
-        if msg.kind is CommKind.POLL and isinstance(req, Request) and req.method is Method.RESUBSCRIBE:
-            return self._resubscribe(url, msg, body)
+        if msg.kind is CommKind.UNSUPPORTED:
+            return _closed(self._unsupported(url, msg))
+        if msg.kind is CommKind.POLL and isinstance(req, Request) and req.method is Method.SUBSCRIBE:
+            return self._subscribe(url, msg, body)
         if msg.kind in (CommKind.POLL, CommKind.CONTROL):
             return _closed(self._task_call(url, msg, body))
-        if msg.delivery is Delivery.BLOCKING:              # message/send on a stream: answer once
+        if msg.delivery is Delivery.BLOCKING:              # SendMessage on a stream: answer once
             return _closed(self.send(url, body))
+        if self.defense and (refused := self._continuation_refused(msg, self.spec.agent_at(url), url)) is not None:
+            return _closed(refused)
         return self._start(url, msg, body, mode="stream").stream
 
-    # --- canonical forms ------------------------------------------------------
-    def _canonical(self, msg: InterAgentMessage, dest: str | None) -> bytes:
-        """What leaves: the checked parts, and only ids the destination itself
-        issued (or the peer's id behind one of this agent's local task ids)."""
+    def _unsupported(self, url: str, msg: InterAgentMessage) -> bytes:
+        """Operations the monitor answers itself instead of relaying. ListTasks lists
+        the tasks this agent started at that peer (all a caller may see there anyway);
+        push notifications and the extended card are not offered."""
+        req = msg.raw
+        assert isinstance(req, Request)
+        if req.method is Method.LIST_TASKS:
+            key = _peer_key(self.spec.agent_at(url), url)
+            ctx, status = req.params.get("contextId"), req.params.get("status")
+            with self._lock:
+                mine = [(t, t.alias_of or t) for t in self._tasks.values() if _peer_key(t.peer, t.url) == key]
+            tasks = [r for view, t in mine
+                     if isinstance(r := self._snapshot(t, msg, view=view).result, Task)
+                     and (not ctx or r.context_id == ctx) and (not status or r.status.state.value == status)]
+            return Response(id=req.id, result=TaskList(tasks, "", len(tasks), len(tasks)), bare=True).to_bytes()
+        if req.method.push_config:
+            return Response(id=req.id, error=RpcError.info(
+                ErrorCode.PUSH_NOTIFICATION_NOT_SUPPORTED, "Push notifications are not supported",
+                "PUSH_NOTIFICATION_NOT_SUPPORTED")).to_bytes()
+        if req.method is Method.GET_EXTENDED_CARD:
+            return Response(id=req.id, error=RpcError.info(
+                ErrorCode.EXTENDED_AGENT_CARD_NOT_CONFIGURED, "No extended agent card is configured",
+                "EXTENDED_AGENT_CARD_NOT_CONFIGURED")).to_bytes()
+        return Response(id=req.id, error=RpcError.info(
+            ErrorCode.UNSUPPORTED_OPERATION, f"{req.method.value} is not supported here",
+            "UNSUPPORTED_OPERATION")).to_bytes()
+
+    # --- ids ----------------------------------------------------------------
+    def _ids_for(self, msg: InterAgentMessage, key: str) -> tuple[str | None, str | None]:
+        """The task and context ids that leave with a request: only ids the peer itself
+        issued, or the peer's ids behind this agent's local ones. Any other id is
+        agent-chosen text and stays behind."""
         task_id = context_id = None
         with self._lock:
             if msg.task_id:
                 local = self._tasks.get(msg.task_id)
-                if local is not None and local.peer == dest and local.remote_id:
-                    task_id = local.remote_id
-                elif dest is not None and (dest, msg.task_id) in self._peer_ids:
+                target = (local.alias_of or local) if local is not None else None
+                if target is not None and _peer_key(local.peer, local.url) == key and target.remote_id:
+                    task_id = target.remote_id
+                elif (key, msg.task_id) in self._peer_ids:
                     task_id = msg.task_id
-            if msg.context_id and dest is not None and (dest, msg.context_id) in self._peer_ids:
-                context_id = msg.context_id
+            if msg.context_id:
+                if (key, msg.context_id) in self._peer_ids:
+                    context_id = msg.context_id
+                else:
+                    context_id = self._contexts.get((key, msg.context_id))
+        return task_id, context_id
+
+    def _canonical(self, msg: InterAgentMessage, dest: str | None, url: str) -> bytes:
+        task_id, context_id = self._ids_for(msg, _peer_key(dest, url))
         return self.adapter.canonical_request(msg, task_id=task_id, context_id=context_id)
 
-    def _learn_ids(self, dest: str, body: bytes, kmid: str | None) -> None:
+    def _continuation_refused(self, msg: InterAgentMessage, dest: str | None, url: str) -> bytes | None:
+        """A message continuing a task names a task this agent knows at that peer
+        (spec 3.4.2: else TaskNotFoundError), one the peer has seen: a task still on
+        hold, or rejected before it left, takes no further messages."""
+        if msg.kind is not CommKind.REQUEST or not msg.task_id:
+            return None
+        key = _peer_key(dest, url)
+        rpc_id = msg.raw.id if isinstance(msg.raw, Request) else None
+        with self._lock:
+            local = self._tasks.get(msg.task_id)
+            if local is not None and _peer_key(local.peer, local.url) == key:
+                target = local.alias_of or local
+                if msg.context_id and msg.context_id != local.context_id:
+                    return Response(id=rpc_id, error=RpcError(
+                        ErrorCode.INVALID_PARAMS, "contextId does not match the task's context")).to_bytes()
+                if target.remote_id:
+                    return None
+                why = "is in a terminal state" if target.state.is_final else "is still working"
+                return Response(id=rpc_id, error=RpcError.info(
+                    ErrorCode.UNSUPPORTED_OPERATION, f"The task {why}", "UNSUPPORTED_OPERATION",
+                    taskId=msg.task_id)).to_bytes()
+            if (key, msg.task_id) in self._peer_ids:
+                return None
+        return _task_not_found(rpc_id, msg.task_id)
+
+    def _agent_view(self, body: bytes, msg: InterAgentMessage, sent: tuple[str | None, str | None],
+                    key: str) -> bytes:
+        """A blocking answer under the ids the agent used. A continuation of one of its
+        local tasks stays under that task's ids. A context the agent named that the
+        peer did not issue -- the peer opened its own -- stays the agent's (spec 3.4.1:
+        a client's contextId is preserved or the request refused, never silently
+        replaced); follow-ups in it reach the peer's."""
+        sent_task, sent_ctx = sent
+        as_task = msg.task_id if msg.task_id and sent_task != msg.task_id else None
+        as_ctx = msg.context_id if msg.context_id and sent_ctx != msg.context_id else None
+        if as_task is None and as_ctx is None:
+            return body
+        try:
+            resp = parse_response(body)
+        except ProtocolError:
+            return body
+        res = resp.result
+        if resp.error is not None or res is None:
+            return body
+        peer_ctx = getattr(res, "context_id", None)
+        with self._lock:
+            local = self._tasks.get(as_task) if as_task else None
+            if as_ctx and peer_ctx:
+                self._contexts.setdefault((key, as_ctx), peer_ctx)
+        ctx = as_ctx or (local.context_id if local is not None else None) or peer_ctx or ""
+        return _relabel(resp, as_task, ctx)
+
+    def _learn_ids(self, key: str, body: bytes, kmid: str | None) -> None:
         try:
             resp = parse_response(body)
         except ProtocolError:
@@ -297,14 +410,23 @@ class EnforcementPoint:
         with self._lock:
             for i in ids:
                 if i:
-                    self._peer_ids.setdefault((dest, i), kmid)
+                    self._peer_ids.setdefault((key, i), kmid)
 
     # --- tasks the agent started ----------------------------------------------
     def _start(self, url: str, msg: InterAgentMessage, body: bytes, *, mode: str) -> _LocalTask:
         dest = self.spec.agent_at(url)
-        local = _LocalTask(id=new_id("task-"), url=url, request=msg, record=None, mode=mode, peer=dest,
-                           context_id=msg.context_id or new_id("ctx-"))
         with self._lock:
+            prev = self._tasks.get(msg.task_id or "")
+            if prev is not None and _peer_key(prev.peer, prev.url) == _peer_key(dest, url):
+                # a continuation of a local task: the same task for the agent, now
+                # tracked through this request (the peer's events cover the whole task)
+                target = prev.alias_of or prev
+                local = _LocalTask(id=prev.id, url=url, request=msg, record=None, mode=mode, peer=dest,
+                                   context_id=prev.context_id, remote_id=target.remote_id,
+                                   remote_context=target.remote_context)
+            else:
+                local = _LocalTask(id=new_id("task-"), url=url, request=msg, record=None, mode=mode,
+                                   peer=dest, context_id=msg.context_id or new_id("ctx-"))
             self._tasks[local.id] = local
         if not self.defense:
             if dest is not None:
@@ -316,9 +438,9 @@ class EnforcementPoint:
             if not ok:
                 self._reject_local(local, notice)
             else:
-                self._spawn(self._dispatch, local, self._canonical(msg, None))
+                self._spawn(self._dispatch, local, self._canonical(msg, None, url))
             return local
-        canon = self._canonical(msg, dest)
+        canon = self._canonical(msg, dest, url)
         rec = self.fabric.new_message(self.agent_id, dest, msg.text, msg.data, delivery=Delivery.STREAMING)
         rec.digest = digest(canon)
         local.record = rec
@@ -331,7 +453,7 @@ class EnforcementPoint:
             self._reject_local(local, d.notice)
         elif d.outcome is Outcome.HOLD:
             local.state = TaskState.WORKING
-            local.stream.put(self.adapter.working(msg, local.id))
+            local.stream.put(self.adapter.working(msg, local.id, context_id=local.context_id))
         elif d.duplicate_of is not None:
             self._alias(local, d.duplicate_of, msg)
         else:
@@ -344,15 +466,15 @@ class EnforcementPoint:
             orig = next((t for t in self._tasks.values() if t.record is original), None)
             if orig is None:
                 local.state, local.notice = TaskState.FAILED, "the original task is unknown"
-                local.stream.put(self.adapter.rejected(msg, local.id, local.notice))
+                local.stream.put(self.adapter.rejected(msg, local.id, local.notice, context_id=local.context_id))
                 local.stream.close()
                 return
             local.alias_of = orig
-            local.stream.put(self._snapshot(orig, msg, as_id=local.id).to_bytes())
+            local.stream.put(self._snapshot(orig, msg, view=local).to_bytes())
             if orig.done:
                 local.stream.close()
             else:
-                orig.mirrors.append((local.id, local.stream))
+                orig.mirrors.append((local.id, local.context_id, local.stream))
 
     def _dispatch(self, local: _LocalTask, body: bytes) -> None:
         if local.mode == "poll":
@@ -381,7 +503,7 @@ class EnforcementPoint:
             self._finish(local)
 
     def _headers(self, rec: MessageRecord | None, task_rec: str | None = None) -> Headers:
-        h: Headers = {FROM_HEADER: self.agent_id}
+        h: Headers = {**version_headers(), FROM_HEADER: self.agent_id}
         if rec is not None:
             h[KMID_HEADER] = rec.kmid
         if task_rec is not None:
@@ -395,34 +517,40 @@ class EnforcementPoint:
         except ConnectionError as e:
             return _error(None, ErrorCode.INTERNAL_ERROR, str(e)), {}
 
-    def _emit(self, local: _LocalTask, body: bytes) -> None:
+    def _emit(self, local: _LocalTask, body: bytes, *, from_peer: bool = True) -> None:
         """Track the task and hand an event to the agent under its local id (and to
         every task mirroring it)."""
-        resp = self._track(local, body)
+        resp = self._track(local, body, from_peer=from_peer)
         if resp is None:
             return
-        local.stream.put(_relabel(resp, local.id))
+        local.stream.put(_relabel(resp, local.id, local.context_id))
         with self._lock:
             mirrors = list(local.mirrors)
-        for mid, s in mirrors:
-            s.put(_relabel(resp, mid))
+        for mid, mctx, s in mirrors:
+            s.put(_relabel(resp, mid, mctx))
 
     def _finish(self, local: _LocalTask) -> None:
         with self._lock:
             local.done = True
             mirrors, local.mirrors = list(local.mirrors), []
         local.stream.close()
-        for _mid, s in mirrors:
+        for _mid, _mctx, s in mirrors:
             s.close()
 
-    def _track(self, local: _LocalTask, body: bytes) -> Response | None:
+    def _track(self, local: _LocalTask, body: bytes, *, from_peer: bool = True) -> Response | None:
+        """Follow the task through an event. Only the peer's own events teach its ids:
+        an answer the monitor gave itself (a rejection) carries the agent's."""
         try:
             resp = parse_response(body)
         except ProtocolError:
             return None
         res = resp.result
+        if from_peer and isinstance(res, (Task, StatusUpdate, ArtifactUpdate, Message)):
+            remote_id = res.id if isinstance(res, Task) else res.task_id
+            local.remote_id = local.remote_id or remote_id
+            if res.context_id:
+                self._remember_context(local, res.context_id)
         if isinstance(res, Task):
-            local.remote_id = local.remote_id or res.id
             local.state = res.status.state
             local.texts, local.data = [], []
             for a in res.artifacts:
@@ -430,16 +558,23 @@ class EnforcementPoint:
             if res.status.message is not None:
                 local.notice = res.status.message.text()
         elif isinstance(res, StatusUpdate):
-            local.remote_id = local.remote_id or res.task_id
             local.state = res.status.state
             if res.status.message is not None:
                 local.notice = res.status.message.text()
         elif isinstance(res, ArtifactUpdate):
-            local.remote_id = local.remote_id or res.task_id
             self._collect(local, res.artifact.parts)
+        elif isinstance(res, Message):                     # a direct answer, no task
+            local.state = TaskState.COMPLETED
+            self._collect(local, res.parts)
         elif resp.error is not None:
             local.state, local.notice = TaskState.FAILED, resp.error.message
         return resp
+
+    def _remember_context(self, local: _LocalTask, remote_ctx: str) -> None:
+        if local.remote_context is None:
+            local.remote_context = remote_ctx
+            with self._lock:
+                self._contexts.setdefault((_peer_key(local.peer, local.url), local.context_id), remote_ctx)
 
     @staticmethod
     def _collect(local: _LocalTask, parts: list) -> None:
@@ -452,11 +587,12 @@ class EnforcementPoint:
     def _reject_local(self, local: _LocalTask, notice: str) -> None:
         local.state = TaskState.REJECTED
         local.notice = notice
-        self._emit(local, self.adapter.rejected(local.request, local.id, notice))
+        self._emit(local, self.adapter.rejected(local.request, local.id, notice, context_id=local.context_id),
+                   from_peer=False)
         self._finish(local)
 
     def _task_call(self, url: str, msg: InterAgentMessage, body: bytes) -> bytes:
-        """tasks/get or tasks/cancel. For a task this agent started: answered here, or
+        """GetTask or CancelTask. For a task this agent started: answered here, or
         forwarded canonically under the peer's id. For a task a peer issued in a
         blocking answer: forwarded canonically. Anything else is unknown -- a poll is
         content leaving the host too, and must not carry what was never decided."""
@@ -464,28 +600,31 @@ class EnforcementPoint:
         with self._lock:
             local = self._tasks.get(msg.task_id or "")
         if local is None:
-            dest = self.spec.agent_at(url)
             if not self.defense:
                 return self._forward(url, body)[0]
-            with self._lock:
-                known = dest is not None and (dest, msg.task_id or "") in self._peer_ids
-                kmid = self._peer_ids.get((dest, msg.task_id or "")) if known else None
+            known, kmid = self._peer_task(url, msg.task_id)
             if not known:
-                return _error(rpc_id, ErrorCode.TASK_NOT_FOUND, f"unknown task {msg.task_id!r}")
+                return _task_not_found(rpc_id, msg.task_id)
             resp, hdrs = self._forward(url, self.adapter.canonical_poll(msg, msg.task_id or ""),
                                        task_rec=kmid)
             self._accept_reply(resp, hdrs)
+            if self.spec.agent_at(url) is None:
+                self._external_inbound(resp, url)
             return resp
         target = local.alias_of or local
         held = (self.defense and target.record is not None and target.record.status is MsgStatus.HELD)
         if msg.kind is CommKind.CONTROL:
             if held or target.remote_id is None or target.state.is_final:
-                return _error(rpc_id, ErrorCode.TASK_NOT_CANCELABLE,
-                              "the task cannot be canceled now" + (" (held for review)" if held else ""))
+                return Response(id=rpc_id, error=RpcError.info(
+                    ErrorCode.TASK_NOT_CANCELABLE,
+                    "Task cannot be canceled now" + (" (held for review)" if held else ""),
+                    "TASK_NOT_CANCELABLE", taskId=local.id)).to_bytes()
             resp, hdrs = self._forward(target.url, self.adapter.canonical_poll(msg, target.remote_id),
                                        task_rec=target.record.kmid if target.record else None)
             self._accept_reply(resp, hdrs)
-            return self._relabel_for(resp, local.id)
+            if target.peer is None:
+                self._external_inbound(resp, target.url)
+            return self._relabel_for(resp, local.id, local.context_id)
         if held:
             self.monitor.await_held(target.record)
         if (target.mode == "poll" and target.remote_id and not target.state.is_final
@@ -494,37 +633,116 @@ class EnforcementPoint:
             poll = self.adapter.canonical_poll(msg, target.remote_id)
             resp, hdrs = self._forward(target.url, poll, task_rec=target.record.kmid)
             self._settle_response(target, resp, hdrs)
-        return self._snapshot(target, msg, as_id=local.id).to_bytes()
+        return self._snapshot(target, msg, view=local, bare=True).to_bytes()
 
-    def _resubscribe(self, url: str, msg: InterAgentMessage, body: bytes) -> EventStream:
+    def _peer_task(self, url: str, task_id: str | None) -> tuple[bool, str | None]:
+        """Whether the peer at `url` issued `task_id` to this agent, and the monitor id
+        of the request it answered."""
+        key = (_peer_key(self.spec.agent_at(url), url), task_id or "")
+        with self._lock:
+            return key in self._peer_ids, self._peer_ids.get(key)
+
+    def _subscribe(self, url: str, msg: InterAgentMessage, body: bytes) -> EventStream:
         with self._lock:
             local = self._tasks.get(msg.task_id or "")
         if local is None:
-            return _closed(self._task_call(url, msg, body))
+            return self._subscribe_peer(url, msg, body)
         target = local.alias_of or local
         if self.defense and target.record is not None and target.record.status is MsgStatus.HELD:
             self.monitor.await_held(target.record)
-        out = EventStream()
+        rpc_id = msg.raw.id if isinstance(msg.raw, Request) else None
         with self._lock:
-            out.put(self._snapshot(target, msg, as_id=local.id).to_bytes())
-            if target.done or target.mode == "poll":
-                out.close()
+            if target.state.is_final:              # SubscribeToTask on a terminal task (spec 9.4.6)
+                return _closed(Response(id=rpc_id, error=RpcError.info(
+                    ErrorCode.UNSUPPORTED_OPERATION, "The task is in a terminal state",
+                    "UNSUPPORTED_OPERATION", taskId=local.id)).to_bytes())
+            if target.mode == "poll":
+                pass                               # no stream of our own: subscribe at the peer
             else:
-                target.mirrors.append((local.id, out))
+                out = EventStream()
+                out.put(self._snapshot(target, msg, view=local).to_bytes())
+                if target.done:
+                    out.close()
+                else:
+                    target.mirrors.append((local.id, local.context_id, out))
+                return out
+        return self._subscribe_remote(target, local, msg)
+
+    def _subscribe_remote(self, target: _LocalTask, view: _LocalTask, msg: InterAgentMessage) -> EventStream:
+        """A subscription to a returnImmediately task: relayed to the peer under its
+        task id, its events presented under the agent's ids. A task the peer has not
+        seen yet (still on hold, or released a moment ago) is answered with its
+        current state; the agent polls on."""
+        rpc_id = msg.raw.id if isinstance(msg.raw, Request) else None
+        rec = target.record
+        if not target.remote_id or (self.defense and rec is not None and rec.status is not MsgStatus.DELIVERED):
+            return _closed(self._snapshot(target, msg, view=view).to_bytes())
+        try:
+            upstream = self.network.stream(target.url, self.adapter.canonical_poll(msg, target.remote_id),
+                                           self._headers(None, rec.kmid if rec is not None else None))
+        except ConnectionError as e:
+            return _closed(_error(rpc_id, ErrorCode.INTERNAL_ERROR, str(e)))
+        out = EventStream()
+
+        def pump() -> None:
+            for ev_body, hdrs in upstream:
+                self._accept_reply(ev_body, hdrs)
+                if target.peer is None:
+                    self._external_inbound(ev_body, target.url)
+                resp = self._track(target, ev_body)
+                if resp is not None:
+                    out.put(_relabel(resp, view.id, view.context_id))
+            out.close()
+
+        self._spawn(pump)
         return out
 
-    def _snapshot(self, local: _LocalTask, msg: InterAgentMessage, as_id: str | None = None) -> Response:
+    def _subscribe_peer(self, url: str, msg: InterAgentMessage, body: bytes) -> EventStream:
+        """SubscribeToTask for a task a peer issued in a blocking answer: relayed as a
+        stream, canonically and under the peer's id, like a poll."""
+        rpc_id = msg.raw.id if isinstance(msg.raw, Request) else None
+        if self.defense:
+            known, kmid = self._peer_task(url, msg.task_id)
+            if not known:
+                return _closed(_task_not_found(rpc_id, msg.task_id))
+            body = self.adapter.canonical_poll(msg, msg.task_id or "")
+        else:
+            kmid = None
+        try:
+            upstream = self.network.stream(url, body, self._headers(None, kmid))
+        except ConnectionError as e:
+            return _closed(_error(rpc_id, ErrorCode.INTERNAL_ERROR, str(e)))
+        out = EventStream()
+
+        external = self.spec.agent_at(url) is None
+
+        def pump() -> None:
+            for ev_body, hdrs in upstream:
+                self._accept_reply(ev_body, hdrs)
+                if external:
+                    self._external_inbound(ev_body, url)
+                out.put(ev_body)
+            out.close()
+
+        self._spawn(pump)
+        return out
+
+    def _snapshot(self, local: _LocalTask, msg: InterAgentMessage, *, view: _LocalTask | None = None,
+                  bare: bool = False) -> Response:
+        """The task as this agent knows it, under the ids of `view` (a task mirroring
+        `local`): a SendMessage / stream answer (wrapped) or a GetTask result (`bare`)."""
+        view = view or local
         parts = [Part.from_text(t) for t in local.texts] + [Part.from_data(d) for d in local.data]
         status = TaskStatus(local.state, message=Message.agent_text(local.notice) if local.notice else None)
-        task = Task(id=as_id or local.id, context_id=local.context_id, status=status,
+        task = Task(id=view.id, context_id=view.context_id, status=status,
                     artifacts=[Artifact(parts=parts)] if parts else [])
         rpc_id = msg.raw.id if isinstance(msg.raw, Request) else None
-        return Response(id=rpc_id, result=task)
+        return Response(id=rpc_id, result=task, bare=bare)
 
     @staticmethod
-    def _relabel_for(body: bytes, task_id: str) -> bytes:
+    def _relabel_for(body: bytes, task_id: str, context_id: str) -> bytes:
         try:
-            return _relabel(parse_response(body), task_id)
+            return _relabel(parse_response(body), task_id, context_id)
         except ProtocolError:
             return body
 
@@ -579,13 +797,17 @@ class EnforcementPoint:
         return None, None
 
     def serve(self, body: bytes, headers: Headers) -> tuple[bytes, Headers]:
+        if not version_supported(headers):
+            return version_error(rpc_id_of(body), headers), {}
         requester, in_reply_to = self._identify(body, headers)
-        resp = self.server.handle(body)
+        resp = self.server.handle(body, version_headers())
         return self._gate_reply(resp, requester, in_reply_to)
 
     def serve_stream(self, body: bytes, headers: Headers) -> EventStream:
+        if not version_supported(headers):
+            return _closed(version_error(rpc_id_of(body), headers))
         requester, in_reply_to = self._identify(body, headers)
-        upstream = self.server.handle_stream(body)
+        upstream = self.server.handle_stream(body, version_headers())
         if requester == PRINCIPAL:
             return upstream
         out = EventStream()
@@ -664,14 +886,19 @@ class EnforcementPoint:
         task_id = reply.task_id or new_id("task-")
         ctx = reply.context_id or new_id("ctx-")
         if isinstance(resp.result, (StatusUpdate, ArtifactUpdate)):
-            result: Any = StatusUpdate(task_id, ctx, status, final=True)
+            result: Any = StatusUpdate(task_id, ctx, status)
         else:
             result = Task(id=task_id, context_id=ctx, status=status)
-        return Response(id=resp.id, result=result).to_bytes()
+        return Response(id=resp.id, result=result, bare=resp.bare and isinstance(result, Task)).to_bytes()
 
 
 def _error(rpc_id: Any, code: int, message: str) -> bytes:
     return Response(id=rpc_id, error=RpcError(int(code), message)).to_bytes()
+
+
+def _task_not_found(rpc_id: Any, task_id: str | None) -> bytes:
+    return Response(id=rpc_id, error=RpcError.info(ErrorCode.TASK_NOT_FOUND, "Task not found",
+                                                   "TASK_NOT_FOUND", taskId=task_id or "")).to_bytes()
 
 
 def _closed(body: bytes) -> EventStream:
@@ -681,20 +908,28 @@ def _closed(body: bytes) -> EventStream:
     return s
 
 
-def _relabel(resp: Response, task_id: str) -> bytes:
-    """A response presented under another task id (the agent's local id)."""
+def _peer_key(dest: str | None, url: str) -> str:
+    """Who issues a peer's ids: an agent of the system, or an outside endpoint."""
+    return dest if dest is not None else url
+
+
+def _relabel(resp: Response, task_id: str | None, context_id: str) -> bytes:
+    """A response presented under other task and context ids (the agent's own)."""
     res = resp.result
     if isinstance(res, Task):
-        res = Task(id=task_id, context_id=res.context_id, status=res.status, artifacts=res.artifacts)
+        res = Task(id=task_id or res.id, context_id=context_id, status=res.status, artifacts=res.artifacts)
     elif isinstance(res, StatusUpdate):
-        res = StatusUpdate(task_id, res.context_id, res.status, res.final)
+        res = StatusUpdate(task_id or res.task_id, context_id, res.status)
     elif isinstance(res, ArtifactUpdate):
-        res = ArtifactUpdate(task_id, res.context_id, res.artifact, res.last_chunk)
-    return Response(id=resp.id, result=res, error=resp.error).to_bytes()
+        res = ArtifactUpdate(task_id or res.task_id, context_id, res.artifact, res.append, res.last_chunk)
+    elif isinstance(res, Message):
+        res = Message(role=res.role, parts=res.parts, message_id=res.message_id,
+                      context_id=context_id, task_id=task_id or res.task_id)
+    return Response(id=resp.id, result=res, error=resp.error, bare=resp.bare).to_bytes()
 
 
 def _is_task_call(body: bytes) -> bool:
     try:
-        return parse_request(body).method in (Method.GET_TASK, Method.RESUBSCRIBE, Method.CANCEL_TASK)
+        return parse_request(body).method in (Method.GET_TASK, Method.SUBSCRIBE, Method.CANCEL_TASK)
     except ProtocolError:
         return False

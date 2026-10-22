@@ -19,12 +19,20 @@ from kairos.mas.serve import Deployment, HostConfig, judge_factory, start  # noq
 from tests.mas_util import ATTACKER_IBAN, banking_spec  # noqa: E402
 
 
+_TAKEN: set[int] = set()
+
+
 def _port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+    """A free port, never one handed out before: the listeners bind later, so the OS
+    may offer a port again that is reserved here but not yet bound."""
+    while True:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        if p not in _TAKEN:
+            _TAKEN.add(p)
+            return p
 
 
 def _run_agent(app, servers) -> str:
@@ -52,7 +60,7 @@ def test_session_through_the_control_endpoint(doc, expect_withheld) -> None:
 
         def assistant(msg, task_id):
             r = client.send_message(spec.agents["documents"].endpoint, "read the bill")
-            return AgentResult(text=f"{r.state.value}: {r.text or r.notice}")
+            return AgentResult(text=f"{r.state.short}: {r.text or r.notice}")
 
         handlers = {"assistant": assistant, "documents": lambda m, t: AgentResult(text=doc)}
         for a, ag in spec.agents.items():
