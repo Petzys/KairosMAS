@@ -1,15 +1,22 @@
 """Release decisions for inter-agent messages, built from the single-agent engine.
 
-A message that leaves its cluster is released like an external request: an HTTP
-POST to the peer's A2A endpoint, evaluated by the same PolicyEngine as every other
-effect -- integrity (is the destination known?), confidentiality (is it cleared for
-the data the message carries?), payload identifiers, and the cluster's rules. Only
-the sending cluster's policy decides, but it decides over the sender's JOINED label
-sets, so data the sender received from elsewhere keeps its labels.
+A message that leaves its cluster is treated like an external request: as an HTTP
+POST of its content to the peer's A2A endpoint, evaluated by the same PolicyEngine as
+every other effect. The engine checks integrity (is the destination known?),
+confidentiality (is the destination cleared for the data the message carries?),
+identifiers embedded in the payload, and the cluster's rules. Only the *sending*
+cluster's policy decides, but it decides over the sender's JOINED label sets, so data
+the sender received from elsewhere keeps its labels.
 
-Two engines per agent share one store: one for external effects (exactly the
-single-agent configuration: the cluster's external contact book), one for messages
-(a contact book of the system's agents).
+Each agent gets two engines over one shared label store:
+
+* `engine` for external effects: exactly the single-agent configuration, with the
+  cluster's external contact book;
+* `messages` for messages that leave the cluster: its "contact book" lists the A2A
+  endpoints of the system's agents (`PeerContactBook`).
+
+Messages inside a cluster are never stalled; `annotate_intra_cluster` only records
+what a cheap check finds, so that the oracle sees it later in a lineage.
 """
 from __future__ import annotations
 
@@ -53,27 +60,32 @@ class PeerContactBook(ContactBook):
             lookup_fields=[], on_miss=on_miss,
             entries=[CbEntry(match=origin, max_level=level) for origin, level in peers]))
         self._external = external
+        # The requester whose reply is being decided right now (normalized origin).
         self._answering: str | None = None
 
     @contextmanager
     def answering(self, endpoint: str) -> Iterator[None]:
         """Scope in which `endpoint` is known: the decision about a reply to it.
         Decisions run under the deciding agent's lock, so the scope is not shared."""
-        prev, self._answering = self._answering, normalize(endpoint_origin(endpoint))
+        previous, self._answering = self._answering, normalize(endpoint_origin(endpoint))
         try:
             yield
         finally:
-            self._answering = prev
+            self._answering = previous
 
     def lookup(self, value: str, strategy: Strategy = Strategy.NORMALIZED) -> CbEntry | None:
-        e = super().lookup(value, strategy)
-        if e is None and self._external is not None:
-            e = self._external.lookup(value, strategy)
-        return e
+        """The entry for `value`: a listed peer first, else the external book's entry."""
+        entry = super().lookup(value, strategy)
+        if entry is None and self._external is not None:
+            entry = self._external.lookup(value, strategy)
+        return entry
 
     def is_known(self, value: str, strategy: Strategy = Strategy.NORMALIZED) -> bool:
-        if super().is_known(value, strategy) or (self._answering is not None
-                                                 and normalize(value) == self._answering):
+        """Known: a listed peer, the requester being answered, or an external contact.
+        (Being known says nothing about clearance; see `lookup`.)"""
+        if super().is_known(value, strategy):
+            return True
+        if self._answering is not None and normalize(value) == self._answering:
             return True
         return self._external is not None and self._external.is_known(value, strategy)
 
@@ -84,6 +96,8 @@ class MessageRuleMatcher(SimpleRuleMatcher):
 
     @staticmethod
     def _arg(event: Event, key: str) -> object | None:
+        # Who a message goes to (and comes from) rides in the event's metadata; every
+        # other parameter is looked up in the message content.
         meta = event.metadata or {}
         if key in ("to_agent", "to_cluster", "from_agent"):
             return meta.get(key)
@@ -112,12 +126,17 @@ class AgentEngines:
 
 
 def build_engines(spec: MASSpec, agent: str, store: TokenStore, *, mode: str = "full") -> AgentEngines:
+    """The two policy engines of `agent`, sharing its label store `store`."""
     policy = spec.agent_policy(agent)
-    cp = spec.cluster_of(agent).policy
-    external = ContactBook(cp.external) if cp.external is not None else None
+    cluster_policy = spec.cluster_of(agent).policy
+    external = ContactBook(cluster_policy.external) if cluster_policy.external is not None else None
+    rules = SimpleRuleMatcher(list(cluster_policy.rules))
     engine = PolicyEngine(policy, store, contact_book=external,
-                          simple_rules=SimpleRuleMatcher(list(cp.rules)), mode=mode)  # type: ignore[arg-type]
+                          simple_rules=rules, mode=mode)  # type: ignore[arg-type]
 
+    # The message engine's contact book: every agent of ANOTHER cluster that the
+    # sending cluster lists, with the clearance it grants that agent. (Agents of the
+    # sender's own cluster never need it: their messages are not decided.)
     sender_cluster = spec.agents[agent].cluster
     peers = []
     for other in spec.agents.values():
@@ -126,11 +145,16 @@ def build_engines(spec: MASSpec, agent: str, store: TokenStore, *, mode: str = "
         level, listed = spec.peer_clearance(agent, other.id)
         if listed and level is not None:
             peers.append((endpoint_origin(other.endpoint), level))
-    book = PeerContactBook(peers, on_miss=cp.peers.on_miss, external=external)
-    msg_policy = Policy(version=policy.version, context=_message_context(policy, cp.message_identifiers),
-                        resources=policy.resources, rules=policy.rules)
-    messages = PolicyEngine(msg_policy, store, contact_book=book,
-                            simple_rules=MessageRuleMatcher(list(cp.rules)), mode=mode)  # type: ignore[arg-type]
+    book = PeerContactBook(peers, on_miss=cluster_policy.peers.on_miss, external=external)
+
+    # The same policy, except for how identifiers embedded in a message are treated
+    # (the cluster's `message_identifiers` setting).
+    message_policy = Policy(version=policy.version,
+                            context=_message_context(policy, cluster_policy.message_identifiers),
+                            resources=policy.resources, rules=policy.rules)
+    message_rules = MessageRuleMatcher(list(cluster_policy.rules))
+    messages = PolicyEngine(message_policy, store, contact_book=book,
+                            simple_rules=message_rules, mode=mode)  # type: ignore[arg-type]
     return AgentEngines(engine=engine, messages=messages, peers=book)
 
 
@@ -148,14 +172,17 @@ def evaluate_message(spec: MASSpec, engines: AgentEngines, sender: str, dest: st
     topology check: the request it answers established the edge."""
     if spec.same_cluster(sender, dest):
         return StageResult(Decision.ALLOW, stage=1, produced_by="intra_cluster")
-    cp = spec.cluster_of(sender).policy
+
+    cluster_policy = spec.cluster_of(sender).policy
     _level, listed = spec.peer_clearance(sender, dest)
-    if not reply and not listed and cp.peers.on_miss is Decision.DENY:
+    if not reply and not listed and cluster_policy.peers.on_miss is Decision.DENY:
         return StageResult(Decision.DENY, stage=1, produced_by="topology",
                            reason=f"agent {dest!r} (cluster {spec.agents[dest].cluster!r}) is not "
                                   f"in the contact book of cluster {spec.agents[sender].cluster!r}")
+
     event = message_event(spec, sender, dest, text, data, reply=reply)
     if reply:
+        # While a reply is decided, its requester counts as a known destination.
         with engines.peers.answering(spec.agents[dest].endpoint):
             return engines.messages.evaluate(event)
     return engines.messages.evaluate(event)
@@ -171,16 +198,19 @@ def annotate_intra_cluster(spec: MASSpec, engines: AgentEngines, sender: str, de
 
     The destination is not checked: inside a cluster every member may talk to every
     other."""
-    ev = message_event(spec, sender, dest, text, data, reply=reply)
-    eng = engines.messages
-    ac = classify(ev, eng.policy)
-    probe = dataclasses.replace(eng.policy, context=dataclasses.replace(
-        eng.policy.context, embedded_identifiers="review"))
-    _dec, reason = check_embedded_identifiers(ev, ac, eng.store, probe, contact_book=engines.peers)
-    level = outbound_sensitivity(ev, ac, eng.store)
-    out: dict[str, Any] = {}
+    event = message_event(spec, sender, dest, text, data, reply=reply)
+    engine = engines.messages
+    action_class = classify(event, engine.policy)
+    # Probe with identifier review switched on, whatever the cluster configured: we
+    # only want to know what the check would find, not to decide anything.
+    probe = dataclasses.replace(engine.policy, context=dataclasses.replace(
+        engine.policy.context, embedded_identifiers="review"))
+    _decision, reason = check_embedded_identifiers(event, action_class, engine.store, probe,
+                                                   contact_book=engines.peers)
+    level = outbound_sensitivity(event, action_class, engine.store)
+    annotation: dict[str, Any] = {}
     if reason:
-        out["identifiers"] = reason
+        annotation["identifiers"] = reason
     if level is not None:
-        out["sensitivity"] = level.name
-    return out
+        annotation["sensitivity"] = level.name
+    return annotation

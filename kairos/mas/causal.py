@@ -1,21 +1,22 @@
 """Causal order across agents without a global clock.
 
-Every event an enforcement point observes gets a per-agent sequence number; a
-message adds one cross-agent edge, from the sender's SEND to the receiver's RECV,
-keyed by the monitor's message id. Program order plus message edges form the
-causal DAG of the session.
+Every event an enforcement point observes gets a per-agent sequence number. A message
+adds one edge between agents, from the sender's SEND to the receiver's RECV, keyed by
+the monitor's message id. Program order (each agent's own sequence) plus these
+message edges form the causal DAG of the session.
 
-The lineage of an event -- every event that happened before it, back to the
+The *lineage* of an event -- every event that happened before it, back to the
 principal's prompt -- is represented by a vector clock: entry X is the highest
-sequence number of agent X the event depends on, so X's events 1..clock[X] are in
-the lineage. Clocks are assigned by the enforcement points, which are in the TCB;
-agents never see or supply them.
+sequence number of agent X the event depends on, so X's events 1..clock[X] are in the
+lineage. The enforcement points assign the clocks; they belong to the trusted
+computing base, and agents never see or supply a clock.
 
-A decision point may receive its members' events out of order (the file and the
-network channel of one host report separately). CausalLog delivers an event only
-once its predecessor in program order and, for a RECV, the matching SEND have been
-delivered, and lets a decision wait until a whole lineage has arrived: an effect is
-decided once all causally preceding events are known.
+A decision point may receive its members' events out of order (the file channel and
+the network channel of one host report separately). `CausalLog` delivers an event
+only once its predecessor in program order has been delivered and, for a RECV, once
+the matching SEND has been delivered (possibly at another decision point). It also
+lets a decision wait until a whole lineage has arrived: an effect is decided only
+when all causally preceding events are known.
 """
 from __future__ import annotations
 
@@ -26,60 +27,70 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+# An event's identity: (agent, sequence number). Sequence numbers start at 1.
 EventId = tuple[str, int]
 
 
 class VectorClock:
-    """Immutable map agent -> highest sequence number in the lineage."""
+    """An immutable map agent -> highest sequence number in a lineage.
 
-    __slots__ = ("_c",)
+    Agents with no events in the lineage are simply absent (sequence 0). The entries
+    are kept as a sorted tuple, so equal clocks compare and hash equal."""
+
+    __slots__ = ("_entries",)
 
     def __init__(self, entries: Mapping[str, int] | Iterable[tuple[str, int]] | None = None) -> None:
         items = dict(entries or {})
-        self._c: tuple[tuple[str, int], ...] = tuple(sorted((a, s) for a, s in items.items() if s > 0))
+        self._entries: tuple[tuple[str, int], ...] = tuple(
+            sorted((agent, seq) for agent, seq in items.items() if seq > 0))
 
     def get(self, agent: str) -> int:
-        for a, s in self._c:
-            if a == agent:
-                return s
+        """The highest sequence number of `agent` in the lineage (0: none)."""
+        for known, seq in self._entries:
+            if known == agent:
+                return seq
         return 0
 
     def merge(self, other: VectorClock) -> VectorClock:
-        out = dict(self._c)
-        for a, s in other._c:
-            if s > out.get(a, 0):
-                out[a] = s
-        return VectorClock(out)
+        """The lineage of both: the entry-wise maximum."""
+        merged = dict(self._entries)
+        for agent, seq in other._entries:
+            if seq > merged.get(agent, 0):
+                merged[agent] = seq
+        return VectorClock(merged)
 
     def tick(self, agent: str, seq: int) -> VectorClock:
-        out = dict(self._c)
-        out[agent] = max(seq, out.get(agent, 0))
-        return VectorClock(out)
+        """This lineage extended by `agent`'s event number `seq`."""
+        ticked = dict(self._entries)
+        ticked[agent] = max(seq, ticked.get(agent, 0))
+        return VectorClock(ticked)
 
     def covers(self, event_id: EventId) -> bool:
+        """Is the event part of this lineage?"""
         agent, seq = event_id
         return seq <= self.get(agent)
 
     def agents(self) -> list[str]:
-        return [a for a, _ in self._c]
+        return [agent for agent, _ in self._entries]
 
     def items(self) -> list[tuple[str, int]]:
-        return list(self._c)
+        return list(self._entries)
 
     def to_dict(self) -> dict[str, int]:
-        return dict(self._c)
+        return dict(self._entries)
 
     def __le__(self, other: VectorClock) -> bool:
-        return all(s <= other.get(a) for a, s in self._c)
+        """Happened-before-or-equal: every event of this lineage is in `other`'s."""
+        return all(seq <= other.get(agent) for agent, seq in self._entries)
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, VectorClock) and self._c == other._c
+        return isinstance(other, VectorClock) and self._entries == other._entries
 
     def __hash__(self) -> int:
-        return hash(self._c)
+        return hash(self._entries)
 
     def __repr__(self) -> str:
-        return "VC(" + ", ".join(f"{a}:{s}" for a, s in self._c) + ")"
+        return "VC(" + ", ".join(f"{agent}:{seq}" for agent, seq in self._entries) + ")"
 
 
 class EventKind(str, Enum):
@@ -94,6 +105,7 @@ class EventKind(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class CausalEvent:
+    """One event of one agent, with the clock of its lineage (which includes itself)."""
     agent: str
     seq: int
     kind: EventKind
@@ -119,8 +131,10 @@ class AgentClock:
         self._lock = threading.Lock()
 
     def stamp(self, merge: VectorClock | None = None) -> tuple[int, VectorClock]:
-        """Next sequence number and the event's clock (merged with `merge`, the
-        clock of the SEND a RECV depends on)."""
+        """The next sequence number and the event's clock.
+
+        `merge` is the clock of the SEND a RECV depends on: receiving a message makes
+        the sender's whole lineage part of the receiver's."""
         with self._lock:
             self._seq += 1
             clock = self._clock if merge is None else self._clock.merge(merge)
@@ -137,22 +151,29 @@ class CausalLog:
     """The events of one decision point's member agents, delivered in causal order.
 
     `foreign_delivered(event_id)` answers whether an event of a NON-member agent has
-    been delivered at its own decision point; a RECV here depends on a SEND there."""
+    been delivered at its own decision point: a RECV here may depend on a SEND there.
+
+    Events are *submitted* in any order and *delivered* (appended to the log) once
+    everything they depend on is delivered; until then they wait in `_pending`.
+    """
 
     def __init__(self, foreign_delivered: Callable[[EventId], bool] | None = None) -> None:
         self._events: dict[str, list[CausalEvent]] = {}
-        # highest delivered sequence number per agent. Written only under _cv, READ without
-        # it: other decision points ask whether an event was delivered while holding their
-        # own log's lock, and taking ours there would order two log locks both ways
-        # (deadlock between two clusters exchanging messages).
+        # The highest delivered sequence number per agent. Written only under _cv, but
+        # READ without it: other decision points ask whether an event was delivered
+        # while they hold their own log's lock. Taking ours there would take two log
+        # locks in both orders, a deadlock between two clusters exchanging messages.
         self._frontier: dict[str, int] = {}
         self._pending: list[CausalEvent] = []
         self._foreign = foreign_delivered or (lambda _eid: False)
+        # Guards _events, _pending and writes to _frontier; waiters in wait_for are
+        # woken whenever something is delivered.
         self._cv = threading.Condition()
 
     # --- delivery -----------------------------------------------------------
     def submit(self, event: CausalEvent) -> list[CausalEvent]:
-        """Buffer `event` until deliverable; return every event delivered by it."""
+        """Buffer `event` until deliverable; return every event delivered by it
+        (it may unblock events that were waiting for it)."""
         with self._cv:
             if self._is_delivered(event.id):
                 return []
@@ -171,25 +192,29 @@ class CausalLog:
             return delivered
 
     def _drain(self) -> list[CausalEvent]:
+        """Deliver pending events until none is ready. One delivery can make another
+        ready (the next event of the same agent), hence the repeated passes."""
         delivered: list[CausalEvent] = []
         progress = True
         while progress:
             progress = False
-            for ev in list(self._pending):
-                if self._ready(ev):
-                    self._pending.remove(ev)
-                    self._events.setdefault(ev.agent, []).append(ev)
-                    self._frontier[ev.agent] = ev.seq
-                    delivered.append(ev)
+            for event in list(self._pending):
+                if self._ready(event):
+                    self._pending.remove(event)
+                    self._events.setdefault(event.agent, []).append(event)
+                    self._frontier[event.agent] = event.seq
+                    delivered.append(event)
                     progress = True
         return delivered
 
-    def _ready(self, ev: CausalEvent) -> bool:
-        if self.frontier(ev.agent) != ev.seq - 1:
+    def _ready(self, event: CausalEvent) -> bool:
+        """Deliverable: the agent's previous event is delivered and, for a RECV, the
+        SEND it depends on is delivered (here or at the sender's decision point)."""
+        if self.frontier(event.agent) != event.seq - 1:
             return False
-        if ev.after is None:
+        if event.after is None:
             return True
-        return self._is_delivered(ev.after) or self._foreign(ev.after)
+        return self._is_delivered(event.after) or self._foreign(event.after)
 
     def _is_delivered(self, eid: EventId) -> bool:
         agent, seq = eid
@@ -204,26 +229,29 @@ class CausalLog:
         return self._frontier.get(agent, 0)
 
     def events(self, agent: str, upto: int | None = None) -> list[CausalEvent]:
+        """`agent`'s delivered events, optionally only those up to sequence `upto`."""
         with self._cv:
-            evs = list(self._events.get(agent, []))
-        return evs if upto is None else [e for e in evs if e.seq <= upto]
+            events = list(self._events.get(agent, []))
+        return events if upto is None else [event for event in events if event.seq <= upto]
 
     def event(self, eid: EventId) -> CausalEvent | None:
         agent, seq = eid
         with self._cv:
-            evs = self._events.get(agent, [])
-            return evs[seq - 1] if 0 < seq <= len(evs) else None
+            events = self._events.get(agent, [])
+            # Delivered events are stored in sequence order, starting at 1.
+            return events[seq - 1] if 0 < seq <= len(events) else None
 
     def pending(self) -> list[CausalEvent]:
         with self._cv:
             return list(self._pending)
 
     def wait_for(self, clock: VectorClock, agents: Iterable[str], timeout: float = 5.0) -> bool:
-        """Block until every event of `agents` covered by `clock` is delivered."""
-        wanted = [(a, clock.get(a)) for a in agents]
+        """Block until every event of `agents` covered by `clock` is delivered.
+        Returns False if that did not happen within `timeout` seconds."""
+        wanted = [(agent, clock.get(agent)) for agent in agents]
         deadline = time.monotonic() + timeout
         with self._cv:
-            while not all(self.frontier(a) >= s for a, s in wanted):
+            while not all(self.frontier(agent) >= seq for agent, seq in wanted):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -231,6 +259,7 @@ class CausalLog:
             return True
 
     def __iter__(self) -> Iterator[CausalEvent]:
+        """All delivered events, in timestamp order (for reports and displays)."""
         with self._cv:
-            evs = [e for agent_evs in self._events.values() for e in agent_evs]
-        return iter(sorted(evs, key=lambda e: (e.ts, e.agent, e.seq)))
+            events = [event for agent_events in self._events.values() for event in agent_events]
+        return iter(sorted(events, key=lambda event: (event.ts, event.agent, event.seq)))
