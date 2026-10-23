@@ -50,6 +50,8 @@ SSE = "text/event-stream"
 
 
 def _is_streaming(body: bytes) -> bool:
+    """Is this a request answered with an SSE stream? (Malformed bodies are not: they
+    get an ordinary JSON-RPC error response.)"""
     try:
         return parse_request(body).method.streams
     except ProtocolError:
@@ -57,11 +59,13 @@ def _is_streaming(body: bytes) -> bool:
 
 
 def _monitor_headers(headers: Any) -> Headers:
-    return {k.lower(): v for k, v in headers.items() if k.lower().startswith(MONITOR_PREFIX)}
+    """The monitor's own headers (x-kairos-*), lower-cased."""
+    return {key.lower(): value for key, value in headers.items() if key.lower().startswith(MONITOR_PREFIX)}
 
 
 def _service_headers(headers: Any) -> Headers:
-    return {k.lower(): v for k, v in headers.items() if k.lower().startswith(SERVICE_PREFIX)}
+    """The A2A service parameters (a2a-*), lower-cased."""
+    return {key.lower(): value for key, value in headers.items() if key.lower().startswith(SERVICE_PREFIX)}
 
 
 def sse_encode(body: bytes, headers: Headers | None = None) -> bytes:
@@ -71,28 +75,33 @@ def sse_encode(body: bytes, headers: Headers | None = None) -> bytes:
 
 
 def sse_events(lines: Iterator[str]) -> Iterator[tuple[bytes, Headers]]:
+    """Split an SSE stream into (event body, monitor headers). A blank line ends an
+    event; comment lines of the form `: x-kairos-...=value` carry the monitor's
+    headers for that event."""
     data: list[str] = []
-    hdrs: Headers = {}
+    headers: Headers = {}
     for line in lines:
         if line == "":
             if data:
-                yield "\n".join(data).encode(), hdrs
-            data, hdrs = [], {}
+                yield "\n".join(data).encode(), headers
+            data, headers = [], {}
         elif line.startswith(":"):
-            k, _, v = line[1:].strip().partition("=")
-            if k.startswith(MONITOR_PREFIX):
-                hdrs[k] = v
+            key, _, value = line[1:].strip().partition("=")
+            if key.startswith(MONITOR_PREFIX):
+                headers[key] = value
         elif line.startswith("data:"):
             data.append(line[5:].lstrip())
     if data:
-        yield "\n".join(data).encode(), hdrs
+        yield "\n".join(data).encode(), headers
 
 
 def _stream_response(stream: EventStream, *, monitor: bool) -> StreamingResponse:
-    def gen() -> Iterator[bytes]:
-        for body, hdrs in stream:
-            yield sse_encode(body, hdrs if monitor else None)
-    return StreamingResponse(gen(), media_type=SSE)
+    """An EventStream as an SSE response. `monitor`: include the monitor headers as
+    comment lines (between hosts only; never toward an agent)."""
+    def generate() -> Iterator[bytes]:
+        for body, headers in stream:
+            yield sse_encode(body, headers if monitor else None)
+    return StreamingResponse(generate(), media_type=SSE)
 
 
 # --- the agent's own server -------------------------------------------------------
@@ -101,10 +110,10 @@ def agent_app(server: A2AServer, path: str = "/a2a") -> Starlette:
 
     def rpc(request: HttpRequest) -> Response:
         body = read_body(request)
-        hdrs = _service_headers(request.headers)
+        headers = _service_headers(request.headers)
         if _is_streaming(body):
-            return _stream_response(server.handle_stream(body, hdrs), monitor=False)
-        return Response(server.handle(body, hdrs), media_type=JSON)
+            return _stream_response(server.handle_stream(body, headers), monitor=False)
+        return Response(server.handle(body, headers), media_type=JSON)
 
     def card(_request: HttpRequest) -> Response:
         return JSONResponse(server.card.to_dict())
@@ -134,12 +143,15 @@ class HttpNetwork:
 
     def request(self, url: str, body: bytes, headers: Headers) -> tuple[bytes, Headers]:
         target = self.resolve(url)
-        r = self._client(target).post(target, content=body, headers={**headers, "content-type": JSON})
-        return r.content, _monitor_headers(r.headers)
+        response = self._client(target).post(target, content=body, headers={**headers, "content-type": JSON})
+        return response.content, _monitor_headers(response.headers)
 
     def stream(self, url: str, body: bytes, headers: Headers) -> EventStream:
+        """POST and read the SSE answer in a background thread. Returns once the
+        connection is up, so that a host that cannot be reached raises
+        ConnectionError here, like `request` does."""
         target = self.resolve(url)
-        out = EventStream()
+        events = EventStream()
         client = self._client(target)
         ready = threading.Event()
         failure: list[BaseException] = []
@@ -147,21 +159,23 @@ class HttpNetwork:
         def pump() -> None:
             try:
                 with client.stream("POST", target, content=body,
-                                   headers={**headers, "content-type": JSON, "accept": SSE}) as r:
+                                   headers={**headers, "content-type": JSON, "accept": SSE}) as response:
                     ready.set()
-                    for ev, hdrs in sse_events(r.iter_lines()):
-                        out.put(ev, hdrs)
+                    for event_body, event_headers in sse_events(response.iter_lines()):
+                        events.put(event_body, event_headers)
             except BaseException as e:            # noqa: BLE001 — surfaced to the caller
                 failure.append(e)
                 ready.set()
             finally:
-                out.close()
+                events.close()
 
         threading.Thread(target=pump, daemon=True).start()
         ready.wait(self.timeout)
-        if failure and not out.history:
+        # A failure before the first event is the caller's error; a stream that broke
+        # later simply ends.
+        if failure and not events.history:
             raise ConnectionError(str(failure[0]))
-        return out
+        return events
 
 
 class HttpAgentServer:
@@ -171,6 +185,8 @@ class HttpAgentServer:
         self.url = url
         self._net = HttpNetwork(client=client, timeout=timeout)
 
+    # Same interface as A2AServer: `headers` None means "an in-process caller", which
+    # over HTTP has to say its version explicitly.
     def handle(self, body: bytes, headers: Headers | None = None) -> bytes:
         return self._net.request(self.url, body, dict(headers) if headers is not None else version_headers())[0]
 
@@ -187,30 +203,33 @@ class HttpClientTransport:
         self._client = client or httpx.Client(timeout=timeout)
 
     def _req(self, url: str) -> tuple[str, dict[str, str]]:
-        u = httpx.URL(url)
-        return self.egress + u.raw_path.decode(), {"host": u.netloc.decode()}
+        """Where to connect (the egress, with the target's path) and the Host header
+        that names the real target."""
+        parsed = httpx.URL(url)
+        return self.egress + parsed.raw_path.decode(), {"host": parsed.netloc.decode()}
 
     def send(self, url: str, body: bytes, headers: Headers | None = None) -> bytes:
-        target, hdrs = self._req(url)
+        target, host = self._req(url)
         service = dict(headers) if headers is not None else version_headers()
-        return self._client.post(target, content=body, headers={**service, **hdrs, "content-type": JSON}).content
+        return self._client.post(target, content=body, headers={**service, **host, "content-type": JSON}).content
 
     def send_stream(self, url: str, body: bytes, headers: Headers | None = None) -> EventStream:
-        target, hdrs = self._req(url)
+        target, host = self._req(url)
         service = dict(headers) if headers is not None else version_headers()
-        out = EventStream()
+        events = EventStream()
 
         def pump() -> None:
             try:
                 with self._client.stream("POST", target, content=body,
-                                         headers={**service, **hdrs, "content-type": JSON, "accept": SSE}) as r:
-                    for ev, _ in sse_events(r.iter_lines()):
-                        out.put(ev)
+                                         headers={**service, **host, "content-type": JSON,
+                                                  "accept": SSE}) as response:
+                    for event_body, _ in sse_events(response.iter_lines()):
+                        events.put(event_body)
             finally:
-                out.close()
+                events.close()
 
         threading.Thread(target=pump, daemon=True).start()
-        return out
+        return events
 
 
 # --- the enforcement point as a sidecar -----------------------------------------
@@ -219,13 +238,16 @@ def ingress_app(ep: Any, path: str = "/a2a") -> Starlette:
 
     def rpc(request: HttpRequest) -> Response:
         body = read_body(request)
-        hdrs = {**_service_headers(request.headers), **_monitor_headers(request.headers)}
+        # From another host's egress: the service parameters and the monitor's headers
+        # (the capability of the message, a poll's task reference, the principal token).
+        headers = {**_service_headers(request.headers), **_monitor_headers(request.headers)}
         if _is_streaming(body):
-            return _stream_response(ep.serve_stream(body, hdrs), monitor=True)
-        resp, out = ep.serve(body, hdrs)
-        return Response(resp, media_type=JSON, headers=out)
+            return _stream_response(ep.serve_stream(body, headers), monitor=True)
+        response_body, response_headers = ep.serve(body, headers)
+        return Response(response_body, media_type=JSON, headers=response_headers)
 
     def card(_request: HttpRequest) -> Response:
+        # Built from the spec, never fetched from the agent (see the module docstring).
         agent = ep.spec.agents[ep.agent_id]
         return JSONResponse(AgentCard(name=agent.id, url=agent.endpoint,
                                       description=agent.description).to_dict())
@@ -250,10 +272,10 @@ def egress_app(ep: Any) -> Any:
             target = raw
         else:
             target = f"http://{request.headers.get('host', '')}{raw}"
-        hdrs = _service_headers(request.headers)          # never the agent's x-kairos-* headers
+        headers = _service_headers(request.headers)          # never the agent's x-kairos-* headers
         if _is_streaming(body):
-            return _stream_response(ep.send_stream(target, body, hdrs), monitor=False)
-        return Response(ep.send(target, body, hdrs), media_type=JSON)
+            return _stream_response(ep.send_stream(target, body, headers), monitor=False)
+        return Response(ep.send(target, body, headers), media_type=JSON)
 
     inner = Starlette(routes=[Route("/{path:path}", forward, methods=["POST"])])
 

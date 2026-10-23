@@ -23,10 +23,16 @@ from kairos.mas.spec import MASSpec
 from kairos.mas.trace import emit
 from kairos.mas.transport import InProcessNetwork
 
+# The agent's logic: (its host, the incoming message, the task id) -> its answer.
 TaskHandler = Callable[["AgentHost", Message, str], AgentResult]
 
 
 class AgentHost:
+    """One agent with its A2A server and client, behind its enforcement point.
+
+    `active` counts the tasks the agent is working on right now; the runtime waits
+    for every host to be idle before it ends a session."""
+
     def __init__(self, fabric: MonitorFabric, agent_id: str, network: InProcessNetwork,
                  handler: TaskHandler | None = None, *, defense: bool = True,
                  formatter: Callable[[Any], str] = str) -> None:
@@ -49,6 +55,7 @@ class AgentHost:
         return self.spec.agents[agent].endpoint
 
     def _on_task(self, msg: Message, task_id: str) -> AgentResult:
+        """The agent's A2A server calls this for every task it receives."""
         if self.handler is None:
             return AgentResult(text="no handler")
         with self._cv:
@@ -85,14 +92,18 @@ class SessionResult:
 
 
 class MASRuntime:
+    """A whole system in one process: one host per agent of the spec, on an
+    in-process network. `handlers` gives each agent its logic (agents without one
+    answer "no handler")."""
+
     def __init__(self, spec: MASSpec, fabric: MonitorFabric, handlers: dict[str, TaskHandler], *,
                  defense: bool = True, formatter: Callable[[Any], str] = str) -> None:
         self.spec = spec
         self.fabric = fabric
         self.network = InProcessNetwork()
-        self.hosts = {a: AgentHost(fabric, a, self.network, handlers.get(a), defense=defense,
-                                   formatter=formatter)
-                      for a in spec.agents}
+        self.hosts = {agent: AgentHost(fabric, agent, self.network, handlers.get(agent), defense=defense,
+                                       formatter=formatter)
+                      for agent in spec.agents}
         self.defense = defense
 
     def run(self, prompt: str, *, timeout: float = 300.0, tick: float = 0.5) -> SessionResult:
@@ -100,8 +111,8 @@ class MASRuntime:
         idle and every background delivery has finished. A watchdog resolves
         branches whose stall budget runs out while their agent is quiet."""
         self.fabric.begin_session(prompt)
-        for h in self.hosts.values():
-            h.ep.reset()
+        for host in self.hosts.values():
+            host.ep.reset()
         stop = threading.Event()
 
         def watchdog() -> None:
@@ -109,28 +120,32 @@ class MASRuntime:
                 if self.defense:
                     self.fabric.tick()
 
-        wd = threading.Thread(target=watchdog, daemon=True)
-        wd.start()
-        t0 = time.monotonic()
+        watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+        watchdog_thread.start()
+        started = time.monotonic()
         try:
             result = self.hosts[self.spec.entry].run_prompt(prompt)
-            quiescent = self.wait_quiescent(timeout=max(1.0, timeout - (time.monotonic() - t0)))
+            # The entry agent has answered, but work it started may still be running
+            # (streamed tasks, held messages released later).
+            quiescent = self.wait_quiescent(timeout=max(1.0, timeout - (time.monotonic() - started)))
         finally:
             stop.set()
-            wd.join(2.0)
+            watchdog_thread.join(2.0)
         report = self.fabric.report()
-        return SessionResult(output=result.text, elapsed=time.monotonic() - t0, report=report,
+        return SessionResult(output=result.text, elapsed=time.monotonic() - started, report=report,
                              quiescent=quiescent)
 
     def wait_quiescent(self, timeout: float = 60.0) -> bool:
+        """Wait until no agent works on a task and no background delivery runs.
+        Returns False if the system was still busy after `timeout`."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            for h in self.hosts.values():
-                h.ep.join(timeout=max(0.0, deadline - time.monotonic()))
-            if all(h.idle() for h in self.hosts.values()) and not self._threads_alive():
+            for host in self.hosts.values():
+                host.ep.join(timeout=max(0.0, deadline - time.monotonic()))
+            if all(host.idle() for host in self.hosts.values()) and not self._threads_alive():
                 return True
             time.sleep(0.02)
         return False
 
     def _threads_alive(self) -> bool:
-        return any(t.is_alive() for h in self.hosts.values() for t in h.ep._threads)
+        return any(thread.is_alive() for host in self.hosts.values() for thread in host.ep._threads)

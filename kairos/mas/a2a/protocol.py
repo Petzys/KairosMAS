@@ -17,6 +17,14 @@ implementation does not speak (VersionNotSupportedError).
 
 Parsing is strict on purpose: the enforcement point decides on what it parsed, so
 it must parse exactly what the receiving agent will.
+
+Reading guide: the enums (`Method`, `TaskState`, `Role`, `ErrorCode`) come first, then
+the content types from the inside out (`Part` -> `Message` -> `TaskStatus`, `Artifact`
+-> `Task`, the two stream events, `TaskList`), then how a result is wrapped
+(`result_to_dict` / `result_from_dict`), the JSON-RPC envelopes (`Request`,
+`Response`, `RpcError`) with their parsers, version negotiation, SSE framing, and the
+agent card. Every type has `to_dict` (to the wire) and, where the monitor reads it,
+`from_dict` (from the wire, raising `ProtocolError` on anything malformed).
 """
 from __future__ import annotations
 
@@ -38,6 +46,7 @@ ERROR_DOMAIN = "a2a-protocol.org"
 
 
 class Method(str, Enum):
+    """The JSON-RPC method names of A2A v1.0."""
     SEND = "SendMessage"                         # caller blocks (unless returnImmediately)
     STREAM = "SendStreamingMessage"              # SSE stream of StreamResponse events
     GET_TASK = "GetTask"
@@ -52,6 +61,7 @@ class Method(str, Enum):
 
     @classmethod
     def parse(cls, name: str) -> "Method | None":
+        """The method of that name, or None (v0.3 names such as `message/send` included)."""
         try:
             return cls(name)
         except ValueError:
@@ -59,6 +69,7 @@ class Method(str, Enum):
 
     @property
     def streams(self) -> bool:
+        """Answered with a server-sent event stream rather than one response."""
         return self in (Method.STREAM, Method.SUBSCRIBE)
 
     @property
@@ -68,6 +79,11 @@ class Method(str, Enum):
 
 
 class TaskState(str, Enum):
+    """The state of a task (proto enum TaskState).
+
+    Terminal states end a task for good. Interrupted states (input or auth required)
+    wait for the caller: a blocking SendMessage returns there, and a later message
+    with the task's id continues it."""
     UNSPECIFIED = "TASK_STATE_UNSPECIFIED"
     SUBMITTED = "TASK_STATE_SUBMITTED"
     WORKING = "TASK_STATE_WORKING"
@@ -80,6 +96,8 @@ class TaskState(str, Enum):
 
     @classmethod
     def parse(cls, raw: Any) -> "TaskState":
+        """Lenient: anything unknown becomes UNSPECIFIED. Reading a response from the
+        wire does NOT use this: `TaskStatus.from_dict` refuses unknown states."""
         try:
             return cls(str(raw))
         except ValueError:
@@ -102,16 +120,18 @@ class TaskState(str, Enum):
 
 
 _TERMINAL = {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED, TaskState.REJECTED}
-_STATES = {s.value for s in TaskState}
+_STATES = {state.value for state in TaskState}
 
 
 class Role(str, Enum):
+    """Who wrote a message: the caller (USER) or the callee (AGENT)."""
     UNSPECIFIED = "ROLE_UNSPECIFIED"
     USER = "ROLE_USER"
     AGENT = "ROLE_AGENT"
 
 
 class ErrorCode(int, Enum):
+    """JSON-RPC error codes: the standard ones, then A2A's own (spec 5.4)."""
     PARSE_ERROR = -32700
     INVALID_REQUEST = -32600
     METHOD_NOT_FOUND = -32601
@@ -129,6 +149,7 @@ class ErrorCode(int, Enum):
 
 
 def new_id(prefix: str = "") -> str:
+    """A fresh random id, e.g. `task-1a2b3c4d5e6f`."""
     return f"{prefix}{uuid.uuid4().hex[:12]}"
 
 
@@ -138,7 +159,8 @@ def utc_now() -> str:
 
 
 class ProtocolError(ValueError):
-    """The body is not a well-formed A2A v1.0 JSON-RPC message."""
+    """The body is not a well-formed A2A v1.0 JSON-RPC message. `code` is the
+    JSON-RPC error code to answer with."""
 
     def __init__(self, message: str, code: int = ErrorCode.INVALID_REQUEST) -> None:
         super().__init__(message)
@@ -146,7 +168,7 @@ class ProtocolError(ValueError):
 
 
 # --- content ---------------------------------------------------------------
-_CONTENT = ("text", "raw", "url", "data")
+_CONTENT = ("text", "raw", "url", "data")     # the members of Part's `content` oneof
 
 
 @dataclass(slots=True)
@@ -178,46 +200,48 @@ class Part:
         return cls(kind="raw", raw=raw, filename=filename, media_type=media_type)
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any]
+        obj: dict[str, Any]
         if self.kind == "text":
-            d = {"text": self.text or ""}
+            obj = {"text": self.text or ""}
         elif self.kind == "raw":
-            d = {"raw": base64.b64encode(self.raw or b"").decode("ascii")}
+            # bytes travel as base64 in ProtoJSON
+            obj = {"raw": base64.b64encode(self.raw or b"").decode("ascii")}
         elif self.kind == "url":
-            d = {"url": self.url or ""}
+            obj = {"url": self.url or ""}
         else:
-            d = {"data": self.data}
+            obj = {"data": self.data}
         if self.filename:
-            d["filename"] = self.filename
+            obj["filename"] = self.filename
         if self.media_type:
-            d["mediaType"] = self.media_type
+            obj["mediaType"] = self.media_type
         if self.metadata:
-            d["metadata"] = self.metadata
-        return d
+            obj["metadata"] = self.metadata
+        return obj
 
     @classmethod
     def from_dict(cls, d: Any) -> "Part":
+        """Read a part; exactly one content member must be set (it is a oneof)."""
         if not isinstance(d, dict):
             raise ProtocolError("a part must be an object", ErrorCode.INVALID_PARAMS)
-        present = [k for k in _CONTENT if k in d]
+        present = [key for key in _CONTENT if key in d]
         if len(present) != 1:
             raise ProtocolError(f"a part sets exactly one of {', '.join(_CONTENT)} (got {present or 'none'})",
                                 ErrorCode.INVALID_PARAMS)
         kind = present[0]
-        p = cls(kind=kind, filename=_opt_str(d.get("filename")), media_type=_opt_str(d.get("mediaType")),
-                metadata=d.get("metadata") if isinstance(d.get("metadata"), dict) else None)
+        part = cls(kind=kind, filename=_opt_str(d.get("filename")), media_type=_opt_str(d.get("mediaType")),
+                   metadata=d.get("metadata") if isinstance(d.get("metadata"), dict) else None)
         if kind == "text":
-            p.text = _str_field(d["text"], "part.text")
+            part.text = _str_field(d["text"], "part.text")
         elif kind == "url":
-            p.url = _str_field(d["url"], "part.url")
+            part.url = _str_field(d["url"], "part.url")
         elif kind == "raw":
             try:
-                p.raw = base64.b64decode(_str_field(d["raw"], "part.raw"), validate=True)
+                part.raw = base64.b64decode(_str_field(d["raw"], "part.raw"), validate=True)
             except (binascii.Error, ValueError):
                 raise ProtocolError("part.raw is not valid base64", ErrorCode.INVALID_PARAMS) from None
         else:
-            p.data = d["data"]
-        return p
+            part.data = d["data"]
+        return part
 
     def as_text(self) -> str:
         """Everything this part carries, as text (what leaves the boundary)."""
@@ -225,13 +249,15 @@ class Part:
             return self.text or ""
         if self.kind == "data":
             return json.dumps(self.data, ensure_ascii=False, sort_keys=True)
-        label = " ".join(x for x in (self.filename, self.media_type) if x)
+        # A file's name and media type are content too: they can carry text.
+        label = " ".join(value for value in (self.filename, self.media_type) if value)
         if self.kind == "url":
             return f"{label} {self.url or ''}".strip()
         return f"{label} {(self.raw or b'').decode('utf-8', errors='replace')}".strip()
 
 
 def _opt_str(v: Any) -> str | None:
+    """A non-empty string, else None."""
     return v if isinstance(v, str) and v else None
 
 
@@ -242,15 +268,21 @@ def _str_field(v: Any, name: str) -> str:
 
 
 def _parts(v: Any, where: str, *, required: bool = True) -> list[Part]:
+    """The `parts` list of a message or artifact (non-empty when required)."""
     if v is None and not required:
         return []
     if not isinstance(v, list) or (required and not v):
         raise ProtocolError(f"{where}.parts must be a non-empty list", ErrorCode.INVALID_PARAMS)
-    return [Part.from_dict(p) for p in v]
+    return [Part.from_dict(part) for part in v]
 
 
 @dataclass(slots=True)
 class Message:
+    """One turn of a conversation: parts written by the caller or the callee.
+
+    `task_id` continues an existing task; `context_id` groups related tasks. Both
+    are free text a sender may choose, which is why the enforcement point forwards
+    only ids the peer issued itself."""
     role: str                                  # "user" (the caller) | "agent" (the callee)
     parts: list[Part]
     message_id: str = field(default_factory=lambda: new_id("msg-"))
@@ -269,29 +301,32 @@ class Message:
         return cls(role="agent", parts=[Part.from_text(text)], **kw)
 
     def text(self) -> str:
-        return "\n".join(p.text or "" for p in self.parts if p.kind == "text")
+        """The text parts only."""
+        return "\n".join(part.text or "" for part in self.parts if part.kind == "text")
 
     def data(self) -> list[Any]:
-        return [p.data for p in self.parts if p.kind == "data"]
+        """The data parts' values."""
+        return [part.data for part in self.parts if part.kind == "data"]
 
     def content_text(self) -> str:
-        return "\n".join(p.as_text() for p in self.parts)
+        """Every part as text: all the content the message carries."""
+        return "\n".join(part.as_text() for part in self.parts)
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"messageId": self.message_id,
-                             "role": (Role.AGENT if self.role == "agent" else Role.USER).value,
-                             "parts": [p.to_dict() for p in self.parts]}
+        obj: dict[str, Any] = {"messageId": self.message_id,
+                               "role": (Role.AGENT if self.role == "agent" else Role.USER).value,
+                               "parts": [part.to_dict() for part in self.parts]}
         if self.context_id:
-            d["contextId"] = self.context_id
+            obj["contextId"] = self.context_id
         if self.task_id:
-            d["taskId"] = self.task_id
+            obj["taskId"] = self.task_id
         if self.metadata:
-            d["metadata"] = self.metadata
+            obj["metadata"] = self.metadata
         if self.extensions:
-            d["extensions"] = list(self.extensions)
+            obj["extensions"] = list(self.extensions)
         if self.reference_task_ids:
-            d["referenceTaskIds"] = list(self.reference_task_ids)
-        return d
+            obj["referenceTaskIds"] = list(self.reference_task_ids)
+        return obj
 
     @classmethod
     def from_dict(cls, d: Any, *, strict: bool = True) -> "Message":
@@ -307,13 +342,13 @@ class Message:
                                 ErrorCode.INVALID_PARAMS) from None
         if role is Role.UNSPECIFIED and strict:
             raise ProtocolError("message.role is unspecified", ErrorCode.INVALID_PARAMS)
-        mid = d.get("messageId")
-        if not isinstance(mid, str) or not mid:
+        message_id = d.get("messageId")
+        if not isinstance(message_id, str) or not message_id:
             if strict:
                 raise ProtocolError("message.messageId is required", ErrorCode.INVALID_PARAMS)
-            mid = new_id("msg-")
+            message_id = new_id("msg-")
         return cls(role="agent" if role is Role.AGENT else "user",
-                   parts=_parts(d.get("parts"), "message"), message_id=mid,
+                   parts=_parts(d.get("parts"), "message"), message_id=message_id,
                    context_id=_opt_str(d.get("contextId")), task_id=_opt_str(d.get("taskId")),
                    metadata=dict(d.get("metadata") or {}),
                    extensions=[str(x) for x in d.get("extensions") or []],
@@ -322,34 +357,36 @@ class Message:
 
 @dataclass(slots=True)
 class TaskStatus:
+    """A task's state, with an optional message from the callee (e.g. why it failed)."""
     state: TaskState
     message: Message | None = None
     timestamp: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"state": self.state.value}
+        obj: dict[str, Any] = {"state": self.state.value}
         if self.message is not None:
-            d["message"] = self.message.to_dict()
+            obj["message"] = self.message.to_dict()
         if self.timestamp:
-            d["timestamp"] = self.timestamp
-        return d
+            obj["timestamp"] = self.timestamp
+        return obj
 
     @classmethod
     def from_dict(cls, d: Any) -> "TaskStatus":
         if not isinstance(d, dict):
             raise ProtocolError("a task status must be an object", ErrorCode.INVALID_AGENT_RESPONSE)
-        state, m = d.get("state"), d.get("message")
+        state, message = d.get("state"), d.get("message")
         if not isinstance(state, str) or state not in _STATES:
             # enum names only (ProtoJSON's canonical form): an unknown or v0.3 state
             # ("completed") is not a v1.0 response
             raise ProtocolError(f"unknown task state {state!r}", ErrorCode.INVALID_AGENT_RESPONSE)
         return cls(state=TaskState(state),
-                   message=Message.from_dict(m, strict=False) if isinstance(m, dict) else None,
+                   message=Message.from_dict(message, strict=False) if isinstance(message, dict) else None,
                    timestamp=_opt_str(d.get("timestamp")))
 
 
 @dataclass(slots=True)
 class Artifact:
+    """An output the callee produced for a task (its parts are the result)."""
     parts: list[Part]
     artifact_id: str = field(default_factory=lambda: new_id("art-"))
     name: str | None = None
@@ -358,16 +395,16 @@ class Artifact:
     extensions: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"artifactId": self.artifact_id, "parts": [p.to_dict() for p in self.parts]}
+        obj: dict[str, Any] = {"artifactId": self.artifact_id, "parts": [part.to_dict() for part in self.parts]}
         if self.name:
-            d["name"] = self.name
+            obj["name"] = self.name
         if self.description:
-            d["description"] = self.description
+            obj["description"] = self.description
         if self.metadata:
-            d["metadata"] = self.metadata
+            obj["metadata"] = self.metadata
         if self.extensions:
-            d["extensions"] = list(self.extensions)
-        return d
+            obj["extensions"] = list(self.extensions)
+        return obj
 
     @classmethod
     def from_dict(cls, d: Any) -> "Artifact":
@@ -380,11 +417,12 @@ class Artifact:
                    extensions=[str(x) for x in d.get("extensions") or []])
 
     def content_text(self) -> str:
-        return "\n".join(p.as_text() for p in self.parts)
+        return "\n".join(part.as_text() for part in self.parts)
 
 
 @dataclass(slots=True)
 class Task:
+    """A unit of work at the callee: its status, its artifacts, and its history."""
     id: str
     context_id: str
     status: TaskStatus
@@ -393,14 +431,14 @@ class Task:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"id": self.id, "contextId": self.context_id, "status": self.status.to_dict()}
+        obj: dict[str, Any] = {"id": self.id, "contextId": self.context_id, "status": self.status.to_dict()}
         if self.artifacts:
-            d["artifacts"] = [a.to_dict() for a in self.artifacts]
+            obj["artifacts"] = [artifact.to_dict() for artifact in self.artifacts]
         if self.history:
-            d["history"] = [m.to_dict() for m in self.history]
+            obj["history"] = [message.to_dict() for message in self.history]
         if self.metadata:
-            d["metadata"] = self.metadata
-        return d
+            obj["metadata"] = self.metadata
+        return obj
 
     @classmethod
     def from_dict(cls, d: Any) -> "Task":
@@ -408,16 +446,16 @@ class Task:
             raise ProtocolError("a task needs an id and a status", ErrorCode.INVALID_AGENT_RESPONSE)
         return cls(id=d["id"], context_id=str(d.get("contextId") or ""),
                    status=TaskStatus.from_dict(d["status"]),
-                   artifacts=[Artifact.from_dict(a) for a in d.get("artifacts") or []],
-                   history=[Message.from_dict(m, strict=False) for m in d.get("history") or []],
+                   artifacts=[Artifact.from_dict(artifact) for artifact in d.get("artifacts") or []],
+                   history=[Message.from_dict(message, strict=False) for message in d.get("history") or []],
                    metadata=dict(d.get("metadata") or {}))
 
     def content_text(self) -> str:
         """The callee's content: artifacts plus the status message."""
-        chunks = [a.content_text() for a in self.artifacts]
+        chunks = [artifact.content_text() for artifact in self.artifacts]
         if self.status.message is not None:
             chunks.append(self.status.message.content_text())
-        return "\n".join(c for c in chunks if c)
+        return "\n".join(chunk for chunk in chunks if chunk)
 
 
 @dataclass(slots=True)
@@ -429,16 +467,16 @@ class StatusUpdate:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"taskId": self.task_id, "contextId": self.context_id,
-                             "status": self.status.to_dict()}
+        obj: dict[str, Any] = {"taskId": self.task_id, "contextId": self.context_id,
+                               "status": self.status.to_dict()}
         if self.metadata:
-            d["metadata"] = self.metadata
-        return d
+            obj["metadata"] = self.metadata
+        return obj
 
 
 @dataclass(slots=True)
 class ArtifactUpdate:
-    """TaskArtifactUpdateEvent."""
+    """TaskArtifactUpdateEvent: an artifact (or a chunk of one) produced by the task."""
     task_id: str
     context_id: str
     artifact: Artifact
@@ -447,15 +485,16 @@ class ArtifactUpdate:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"taskId": self.task_id, "contextId": self.context_id,
-                             "artifact": self.artifact.to_dict()}
+        obj: dict[str, Any] = {"taskId": self.task_id, "contextId": self.context_id,
+                               "artifact": self.artifact.to_dict()}
+        # ProtoJSON omits fields at their default value.
         if self.append:
-            d["append"] = True
+            obj["append"] = True
         if self.last_chunk:
-            d["lastChunk"] = True
+            obj["lastChunk"] = True
         if self.metadata:
-            d["metadata"] = self.metadata
-        return d
+            obj["metadata"] = self.metadata
+        return obj
 
 
 @dataclass(slots=True)
@@ -467,7 +506,7 @@ class TaskList:
     total_size: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {"tasks": [t.to_dict() for t in self.tasks], "nextPageToken": self.next_page_token,
+        return {"tasks": [task.to_dict() for task in self.tasks], "nextPageToken": self.next_page_token,
                 "pageSize": self.page_size, "totalSize": self.total_size}
 
 
@@ -489,10 +528,13 @@ def result_to_dict(res: Result, *, bare: bool = False) -> dict[str, Any]:
 
 
 def result_from_dict(d: Any) -> tuple[Result, bool]:
-    """(result, bare): which payload of the oneof is set, or a bare Task / task list."""
+    """(result, bare): which payload of the oneof is set, or a bare Task / task list.
+
+    A result that sets more than one payload is refused: two readers could pick
+    different ones, and the monitor must read what the receiver will."""
     if not isinstance(d, dict):
         raise ProtocolError("result must be an object", ErrorCode.INVALID_AGENT_RESPONSE)
-    payload = [k for k in ("task", "message", "statusUpdate", "artifactUpdate") if k in d]
+    payload = [key for key in ("task", "message", "statusUpdate", "artifactUpdate") if key in d]
     if len(payload) > 1:
         raise ProtocolError("result sets more than one payload", ErrorCode.INVALID_AGENT_RESPONSE)
     if payload == ["task"]:
@@ -500,24 +542,26 @@ def result_from_dict(d: Any) -> tuple[Result, bool]:
     if payload == ["message"]:
         return Message.from_dict(d["message"], strict=False), False
     if payload == ["statusUpdate"]:
-        s = d["statusUpdate"]
-        if not isinstance(s, dict):
+        update = d["statusUpdate"]
+        if not isinstance(update, dict):
             raise ProtocolError("statusUpdate must be an object", ErrorCode.INVALID_AGENT_RESPONSE)
-        return StatusUpdate(task_id=str(s.get("taskId", "")), context_id=str(s.get("contextId", "")),
-                            status=TaskStatus.from_dict(s.get("status")),
-                            metadata=dict(s.get("metadata") or {})), False
+        return StatusUpdate(task_id=str(update.get("taskId", "")), context_id=str(update.get("contextId", "")),
+                            status=TaskStatus.from_dict(update.get("status")),
+                            metadata=dict(update.get("metadata") or {})), False
     if payload == ["artifactUpdate"]:
-        a = d["artifactUpdate"]
-        if not isinstance(a, dict):
+        update = d["artifactUpdate"]
+        if not isinstance(update, dict):
             raise ProtocolError("artifactUpdate must be an object", ErrorCode.INVALID_AGENT_RESPONSE)
-        return ArtifactUpdate(task_id=str(a.get("taskId", "")), context_id=str(a.get("contextId", "")),
-                              artifact=Artifact.from_dict(a.get("artifact")),
-                              append=bool(a.get("append", False)), last_chunk=bool(a.get("lastChunk", False)),
-                              metadata=dict(a.get("metadata") or {})), False
+        return ArtifactUpdate(task_id=str(update.get("taskId", "")), context_id=str(update.get("contextId", "")),
+                              artifact=Artifact.from_dict(update.get("artifact")),
+                              append=bool(update.get("append", False)),
+                              last_chunk=bool(update.get("lastChunk", False)),
+                              metadata=dict(update.get("metadata") or {})), False
     if "tasks" in d:
-        return TaskList(tasks=[Task.from_dict(t) for t in d.get("tasks") or []],
+        return TaskList(tasks=[Task.from_dict(task) for task in d.get("tasks") or []],
                         next_page_token=str(d.get("nextPageToken", "")),
                         page_size=int(d.get("pageSize") or 0), total_size=int(d.get("totalSize") or 0)), True
+    # No wrapper: a bare Task (the answer to GetTask or CancelTask).
     return Task.from_dict(d), True
 
 
@@ -528,41 +572,46 @@ def result_text(result: Result) -> str:
     if isinstance(result, ArtifactUpdate):
         return result.artifact.content_text()
     if isinstance(result, TaskList):
-        return "\n".join(t.content_text() for t in result.tasks)
+        return "\n".join(task.content_text() for task in result.tasks)
     return result.status.message.content_text() if result.status.message else ""
 
 
 # --- JSON-RPC envelopes -----------------------------------------------------
 @dataclass(slots=True)
 class Request:
+    """A JSON-RPC request. `params` is kept as received; the properties read the
+    fields the monitor needs."""
     method: Method
     params: dict[str, Any]
     id: str | int | None = field(default_factory=lambda: new_id("rpc-"))
 
     @property
     def message(self) -> Message | None:
-        m = self.params.get("message")
-        return Message.from_dict(m) if isinstance(m, dict) else None
+        """The message of a SendMessage / SendStreamingMessage (strictly parsed)."""
+        message = self.params.get("message")
+        return Message.from_dict(message) if isinstance(message, dict) else None
 
     @property
     def configuration(self) -> dict[str, Any]:
-        c = self.params.get("configuration")
-        return c if isinstance(c, dict) else {}
+        configuration = self.params.get("configuration")
+        return configuration if isinstance(configuration, dict) else {}
 
     @property
     def return_immediately(self) -> bool:
+        """SendMessage that answers at once with the task in progress (the caller polls)."""
         return self.method is Method.SEND and self.configuration.get("returnImmediately") is True
 
     @property
     def task_id(self) -> str | None:
-        v = self.params.get("id")
-        return v if isinstance(v, str) and v else None
+        """The task a GetTask / CancelTask / SubscribeToTask is about."""
+        task_id = self.params.get("id")
+        return task_id if isinstance(task_id, str) and task_id else None
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"jsonrpc": JSONRPC, "id": self.id, "method": self.method.value}
+        obj: dict[str, Any] = {"jsonrpc": JSONRPC, "id": self.id, "method": self.method.value}
         if self.params or self.method is not Method.GET_EXTENDED_CARD:
-            d["params"] = self.params
-        return d
+            obj["params"] = self.params
+        return obj
 
     def to_bytes(self) -> bytes:
         return json.dumps(self.to_dict(), ensure_ascii=False).encode()
@@ -589,15 +638,16 @@ class Request:
 
 @dataclass(slots=True)
 class RpcError:
+    """A JSON-RPC error object. `data` holds structured details (ErrorInfo)."""
     code: int
     message: str
     data: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"code": self.code, "message": self.message}
+        obj: dict[str, Any] = {"code": self.code, "message": self.message}
         if self.data:
-            d["data"] = self.data
-        return d
+            obj["data"] = self.data
+        return obj
 
     @classmethod
     def info(cls, code: ErrorCode, message: str, reason: str, **metadata: str) -> "RpcError":
@@ -605,49 +655,55 @@ class RpcError:
         detail: dict[str, Any] = {"@type": "type.googleapis.com/google.rpc.ErrorInfo",
                                   "reason": reason, "domain": ERROR_DOMAIN}
         if metadata:
-            detail["metadata"] = {k: str(v) for k, v in metadata.items()}
+            detail["metadata"] = {key: str(value) for key, value in metadata.items()}
         return cls(int(code), message, [detail])
 
 
 @dataclass(slots=True)
 class Response:
+    """A JSON-RPC response: a result or an error."""
     id: str | int | None
     result: Result | None = None
     error: RpcError | None = None
     bare: bool = False            # a GetTask / CancelTask / ListTasks result (no oneof wrapper)
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"jsonrpc": JSONRPC, "id": self.id}
+        obj: dict[str, Any] = {"jsonrpc": JSONRPC, "id": self.id}
         if self.error is not None:
-            d["error"] = self.error.to_dict()
+            obj["error"] = self.error.to_dict()
         else:
-            d["result"] = result_to_dict(self.result, bare=self.bare) if self.result is not None else None
-        return d
+            obj["result"] = result_to_dict(self.result, bare=self.bare) if self.result is not None else None
+        return obj
 
     def to_bytes(self) -> bytes:
         return json.dumps(self.to_dict(), ensure_ascii=False).encode()
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Response":
-        err = d.get("error")
-        if err is not None:
-            if not isinstance(err, dict) or not isinstance(err.get("code"), int):
+        error = d.get("error")
+        if error is not None:
+            if not isinstance(error, dict) or not isinstance(error.get("code"), int):
                 raise ProtocolError("malformed error object", ErrorCode.INVALID_AGENT_RESPONSE)
-            data = err.get("data")
-            return cls(id=d.get("id"), error=RpcError(int(err["code"]), str(err.get("message", "")),
+            data = error.get("data")
+            return cls(id=d.get("id"), error=RpcError(int(error["code"]), str(error.get("message", "")),
                                                       data if isinstance(data, list) else None))
         result, bare = result_from_dict(d.get("result"))
         return cls(id=d.get("id"), result=result, bare=bare)
 
 
 def parse_request(body: bytes | str | dict[str, Any]) -> Request:
-    d = _load(body)
-    if d.get("jsonrpc") != JSONRPC or not isinstance(d.get("method"), str):
+    """Read a request, refusing anything that is not a well-formed A2A v1.0 call.
+
+    The checks here are the minimum the monitor relies on: a known v1.0 method, an
+    object as params, a message for the send methods, a task id for the task methods.
+    The message itself is parsed (strictly) when it is read."""
+    obj = _load(body)
+    if obj.get("jsonrpc") != JSONRPC or not isinstance(obj.get("method"), str):
         raise ProtocolError("not a JSON-RPC 2.0 request", ErrorCode.INVALID_REQUEST)
-    method = Method.parse(d["method"])
+    method = Method.parse(obj["method"])
     if method is None:
-        raise ProtocolError(f"unknown A2A v1.0 method {d['method']!r}", ErrorCode.METHOD_NOT_FOUND)
-    params = d.get("params", {})
+        raise ProtocolError(f"unknown A2A v1.0 method {obj['method']!r}", ErrorCode.METHOD_NOT_FOUND)
+    params = obj.get("params", {})
     if not isinstance(params, dict):
         raise ProtocolError("params must be an object", ErrorCode.INVALID_PARAMS)
     if method in (Method.SEND, Method.STREAM) and not isinstance(params.get("message"), dict):
@@ -655,26 +711,28 @@ def parse_request(body: bytes | str | dict[str, Any]) -> Request:
     if method in (Method.GET_TASK, Method.CANCEL_TASK, Method.SUBSCRIBE) and not (
             isinstance(params.get("id"), str) and params["id"]):
         raise ProtocolError(f"{method.value} needs params.id", ErrorCode.INVALID_PARAMS)
-    return Request(method=method, params=params, id=d.get("id"))
+    return Request(method=method, params=params, id=obj.get("id"))
 
 
 def parse_response(body: bytes | str | dict[str, Any]) -> Response:
-    d = _load(body)
-    if d.get("jsonrpc") != JSONRPC or ("result" not in d and "error" not in d):
+    """Read a response (or one stream event); anything malformed raises ProtocolError."""
+    obj = _load(body)
+    if obj.get("jsonrpc") != JSONRPC or ("result" not in obj and "error" not in obj):
         raise ProtocolError("not a JSON-RPC 2.0 response", ErrorCode.INVALID_AGENT_RESPONSE)
-    return Response.from_dict(d)
+    return Response.from_dict(obj)
 
 
 def _load(body: bytes | str | dict[str, Any]) -> dict[str, Any]:
+    """The body as a JSON object (a dict is taken as already parsed)."""
     if isinstance(body, dict):
         return body
     try:
-        d = json.loads(body)
+        obj = json.loads(body)
     except (ValueError, TypeError) as e:
         raise ProtocolError(f"invalid JSON: {e}", ErrorCode.PARSE_ERROR) from None
-    if not isinstance(d, dict):
+    if not isinstance(obj, dict):
         raise ProtocolError("JSON-RPC message must be an object", ErrorCode.INVALID_REQUEST)
-    return d
+    return obj
 
 
 def error_response(rpc_id: Any, code: int, message: str) -> bytes:
@@ -685,8 +743,9 @@ def error_response(rpc_id: Any, code: int, message: str) -> bytes:
 def requested_version(headers: Mapping[str, str] | None) -> str:
     """The Major.Minor a request asks for; an empty value means 0.3 (spec 3.6.2)."""
     if headers is None:
+        # No headers at all: an in-process call from a component of this implementation.
         return A2A_VERSION
-    raw = next((v for k, v in headers.items() if k.lower() == VERSION_HEADER), "")
+    raw = next((value for key, value in headers.items() if key.lower() == VERSION_HEADER), "")
     parts = str(raw).strip().split(".")
     return ".".join(parts[:2]) if raw and str(raw).strip() else "0.3"
 
@@ -697,6 +756,7 @@ def version_supported(headers: Mapping[str, str] | None) -> bool:
 
 
 def version_error(rpc_id: Any, headers: Mapping[str, str] | None) -> bytes:
+    """The VersionNotSupportedError answer to a request for another version."""
     asked = requested_version(headers)
     return Response(id=rpc_id, error=RpcError.info(
         ErrorCode.VERSION_NOT_SUPPORTED,
@@ -705,10 +765,12 @@ def version_error(rpc_id: Any, headers: Mapping[str, str] | None) -> bytes:
 
 
 def version_headers() -> dict[str, str]:
+    """The service parameter every request of this implementation carries."""
     return {VERSION_HEADER: A2A_VERSION}
 
 
 def rpc_id_of(body: bytes | str | dict[str, Any]) -> Any:
+    """The JSON-RPC id of a body, if it has one (to answer even a malformed request)."""
     try:
         return _load(body).get("id")
     except ProtocolError:
@@ -722,13 +784,14 @@ def sse_event(response: Response) -> bytes:
 
 
 def parse_sse(stream: bytes | str) -> list[Response]:
+    """All events of a complete SSE body, each parsed as a response."""
     text = stream.decode() if isinstance(stream, bytes) else stream
-    out: list[Response] = []
+    responses: list[Response] = []
     for block in text.split("\n\n"):
         data = "".join(line[5:].strip() for line in block.splitlines() if line.startswith("data:"))
         if data:
-            out.append(parse_response(data))
-    return out
+            responses.append(parse_response(data))
+    return responses
 
 
 # --- discovery ----------------------------------------------------------------
@@ -743,6 +806,7 @@ class AgentCard:
     skills: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
+        # The spec requires at least one skill; without any, the agent itself is one.
         skills = self.skills or [{"id": self.name, "name": self.name,
                                   "description": self.description or self.name, "tags": [self.name]}]
         return {"name": self.name, "description": self.description or self.name,

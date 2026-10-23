@@ -60,12 +60,14 @@ def message_text(msg: dict[str, Any]) -> str:
 
 def _completion(content: str | None, calls: list[tuple[str, dict[str, Any]]] | None = None,
                 prompt_chars: int = 0, seq: int = 0) -> Any:
+    """An object shaped like an OpenAI chat completion: a text answer and/or tool
+    calls, with token counts estimated as characters / 4."""
     tool_calls = None
     if calls:
         tool_calls = [SimpleNamespace(id=f"stub-{seq}-{i}", type="function",
-                                      function=SimpleNamespace(name=n, arguments=json.dumps(a)))
-                      for i, (n, a) in enumerate(calls)]
-    out_chars = len(content or "") + sum(len(json.dumps(a)) for _, a in calls or [])
+                                      function=SimpleNamespace(name=name, arguments=json.dumps(args)))
+                      for i, (name, args) in enumerate(calls)]
+    out_chars = len(content or "") + sum(len(json.dumps(args)) for _, args in calls or [])
     message = SimpleNamespace(content=content, tool_calls=tool_calls, role="assistant",
                               model_extra={})
     usage = SimpleNamespace(prompt_tokens=prompt_chars // 4, completion_tokens=max(1, out_chars // 4),
@@ -85,8 +87,10 @@ class StubChatClient:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
     def create(self, model: str, messages: list[dict[str, Any]], tools: Any = None, **_: Any) -> Any:
+        """Answer one request: as the oracle if the system prompt is the security
+        reviewer's, otherwise as an agent (through the agent policy, if one is set)."""
         self.requests += 1
-        chars = sum(len(message_text(m)) for m in messages)
+        chars = sum(len(message_text(message)) for message in messages)
         system = (message_text(messages[0])
                   if messages and messages[0].get("role") in ("system", "developer") else "")
         if "security reviewer" in system:
@@ -94,24 +98,26 @@ class StubChatClient:
             return _completion(judge_reply(message_text(messages[-1])), prompt_chars=chars, seq=self.requests)
         if self.agent_policy is None:
             return _completion("(stub model) Done.", prompt_chars=chars, seq=self.requests)
-        tools = [t for t in tools or [] if isinstance(t, dict)]
+        tools = [tool for tool in tools or [] if isinstance(tool, dict)]
         action = self.agent_policy(messages, tools)
         return _completion(action.content, action.calls, prompt_chars=chars, seq=self.requests)
 
 
 # --- the oracle rule -------------------------------------------------------------
 def _pending_actions(prompt: str) -> list[str]:
+    """The lines of the prompt's PENDING ACTIONS list ("[0] send_money(...)"), without
+    their index."""
     head = prompt.split("PENDING ACTIONS", 1)
     if len(head) < 2:
         return []
-    out = []
+    actions = []
     for line in head[1].split("\n")[1:]:
         if not line.strip():
             break
-        m = re.match(r"\s*\[(\d+)\]\s*(.*)", line)
-        if m:
-            out.append(m.group(2))
-    return out
+        match = re.match(r"\s*\[(\d+)\]\s*(.*)", line)
+        if match:
+            actions.append(match.group(2))
+    return actions
 
 
 def salient_values(action_line: str) -> list[str]:
@@ -119,32 +125,36 @@ def salient_values(action_line: str) -> list[str]:
     args = action_line.split("(", 1)[1] if "(" in action_line else action_line
     args = args.split("reason_held:", 1)[0]
     args = re.sub(r"\[origin:[^\]]*\]", " ", args)           # provenance labels are not values
-    vals = [v for _k, v in embedded_values(args)]
-    for tok in _SALIENT.findall(args):
-        if any(c.isdigit() for c in tok) or "_" in tok or "@" in tok:
-            vals.append(tok.rstrip(".,;:"))
-    return list(dict.fromkeys(v for v in vals if len(v) >= 6))
+    values = [value for _kind, value in embedded_values(args)]
+    for token in _SALIENT.findall(args):
+        if any(char.isdigit() for char in token) or "_" in token or "@" in token:
+            values.append(token.rstrip(".,;:"))
+    # Unique, in order of appearance; very short values would match by accident.
+    return list(dict.fromkeys(value for value in values if len(value) >= 6))
 
 
 def _injected_regions(text: str) -> list[str]:
-    low = text.lower()
+    """The (lower-cased) text right after every injection marker in `text`."""
+    lowered = text.lower()
     regions = []
     for marker in INJECTION_MARKERS:
-        start = 0
-        while (i := low.find(marker, start)) >= 0:
-            regions.append(low[i:i + _WINDOW])
-            start = i + 1
+        position = lowered.find(marker)
+        while position >= 0:
+            regions.append(lowered[position:position + _WINDOW])
+            position = lowered.find(marker, position + 1)
     return regions
 
 
 def judge_reply(prompt: str) -> str:
+    """The stub oracle's verdict on an oracle prompt: a pending action is inconsistent
+    iff one of its salient values occurs in injected text (after the pending list)."""
     actions = _pending_actions(prompt)
     rest = prompt.split("PENDING ACTIONS", 1)[-1]
     rest = rest.split("\n\n", 1)[-1]                          # everything after the pending list
     regions = _injected_regions(rest)
     verdicts, quotes = [], []
     for i, line in enumerate(actions):
-        hits = [v for v in salient_values(line) if any(v.lower() in r for r in regions)]
+        hits = [value for value in salient_values(line) if any(value.lower() in region for region in regions)]
         verdicts.append({"index": i, "consistent": not hits,
                          "reason": (f"{hits[0]} comes from injected instructions" if hits
                                     else "no injected instruction behind it")})

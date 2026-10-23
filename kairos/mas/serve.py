@@ -60,6 +60,7 @@ from kairos.mas.stub_llm import StubChatClient, is_stub
 
 @dataclass(slots=True)
 class HostConfig:
+    """Where one agent's three listeners are (see the module docstring)."""
     agent: str           # the agent's private A2A URL
     ingress: str         # host:port to listen on for its public endpoint
     egress: str          # host:port to listen on for its outbound traffic
@@ -71,10 +72,14 @@ class HostConfig:
 
 def load_hosts(path: str | Path) -> dict[str, HostConfig]:
     raw = yaml.safe_load(Path(path).read_text()) or {}
-    return {a: HostConfig(**{k: str(v) for k, v in d.items()}) for a, d in raw.items()}
+    return {agent: HostConfig(**{key: str(value) for key, value in entry.items()})
+            for agent, entry in raw.items()}
 
 
 def judge_factory(kind: str):
+    """The fabric's judge factory for `--oracle deterministic` or `--oracle llm` (the
+    model comes from KAIROS_JUDGE_MODEL: a provider model, `stub`, or
+    `claude-code[:<model>]`)."""
     if kind == "deterministic":
         return lambda _m: DeterministicJudge()
     model = os.environ.get("KAIROS_JUDGE_MODEL") or "gpt-4o-mini"   # empty stub = unset
@@ -95,26 +100,32 @@ def judge_factory(kind: str):
 
 
 class Deployment:
+    """Every host's enforcement point, the network between their ingresses, and the
+    principal's control endpoint. Sessions run one at a time."""
+
     def __init__(self, spec: MASSpec, hosts: dict[str, HostConfig], fabric: MonitorFabric) -> None:
         missing = sorted(set(spec.agents) - set(hosts))
         if missing:
             raise ValueError(f"hosts file lacks agent(s): {', '.join(missing)}")
         self.spec, self.hosts, self.fabric = spec, hosts, fabric
-        by_origin = {endpoint_origin(spec.agents[a].endpoint): h.ingress_url() for a, h in hosts.items()}
+        # A spec endpoint (what agents address) is reached at its host's ingress.
+        by_origin = {endpoint_origin(spec.agents[agent].endpoint): host.ingress_url()
+                     for agent, host in hosts.items()}
         self.network = HttpNetwork(resolve=lambda url: by_origin.get(endpoint_origin(url), url))
         self.eps = {}
-        for a, h in hosts.items():
-            ep = EnforcementPoint(fabric, a, self.network)
-            ep.server = HttpAgentServer(h.agent)
-            self.eps[a] = ep
+        for agent, host in hosts.items():
+            ep = EnforcementPoint(fabric, agent, self.network)
+            ep.server = HttpAgentServer(host.agent)
+            self.eps[agent] = ep
         self._lock = threading.Lock()
 
     def apps(self) -> list[tuple[str, Starlette]]:
-        out = []
-        for a, h in self.hosts.items():
-            out.append((h.ingress, ingress_app(self.eps[a])))
-            out.append((h.egress, egress_app(self.eps[a])))
-        return out
+        """(bind address, app) for every host's ingress and egress listener."""
+        listeners = []
+        for agent, host in self.hosts.items():
+            listeners.append((host.ingress, ingress_app(self.eps[agent])))
+            listeners.append((host.egress, egress_app(self.eps[agent])))
+        return listeners
 
     def run_session(self, prompt: str) -> dict[str, Any]:
         """The principal's prompt: seed T_0, then deliver it to the entry agent through
@@ -126,13 +137,16 @@ class Deployment:
                 ep.reset()
             entry = self.spec.entry
             principal = {PRINCIPAL_HEADER: self.fabric.principal_token}
-            client = A2AClient(lambda url, body, h: self.network.request(url, body, {**h, **principal})[0],
-                               lambda url, body, h: self.network.stream(url, body, {**h, **principal}))
-            r = client.send_message(self.spec.agents[entry].endpoint, prompt)
+            client = A2AClient(
+                lambda url, body, headers: self.network.request(url, body, {**headers, **principal})[0],
+                lambda url, body, headers: self.network.stream(url, body, {**headers, **principal}))
+            answer = client.send_message(self.spec.agents[entry].endpoint, prompt)
+            # Let background deliveries (released held messages) finish before reporting.
             deadline = time.monotonic() + 60
             for ep in self.eps.values():
                 ep.join(timeout=max(0.0, deadline - time.monotonic()))
-            return {"state": r.state.short, "answer": r.text or r.notice, "report": self.fabric.report()}
+            return {"state": answer.state.short, "answer": answer.text or answer.notice,
+                    "report": self.fabric.report()}
 
     def control_app(self) -> Starlette:
         def session(request: HttpRequest) -> JSONResponse:

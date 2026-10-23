@@ -4,6 +4,11 @@ The agent's side of the protocol, used by benchmark agents as their messaging
 tools. Its two transport functions are whatever the agent's host provides; on a
 monitored host they lead into the host's enforcement point, which the client
 cannot tell apart from the network. Every request carries `A2A-Version: 1.0`.
+
+Two ways to talk to another agent:
+  * `send_message`: SendMessage, wait for the answer;
+  * `start_task` + `wait_task` / `poll`: SendStreamingMessage, return as soon as the
+    task exists, and collect the rest of the stream in the background.
 """
 from __future__ import annotations
 
@@ -19,12 +24,13 @@ from kairos.mas.a2a.protocol import (
 )
 from kairos.mas.transport import EventStream, Headers
 
-SendFn = Callable[[str, bytes, Headers], bytes]
-StreamFn = Callable[[str, bytes, Headers], EventStream]
+SendFn = Callable[[str, bytes, Headers], bytes]           # (url, body, headers) -> response body
+StreamFn = Callable[[str, bytes, Headers], EventStream]   # (url, body, headers) -> event stream
 
 
 @dataclass(slots=True)
 class ClientResult:
+    """What the agent learns about a task: its state and the content so far."""
     state: TaskState
     text: str = ""
     data: list[Any] = field(default_factory=list)
@@ -45,13 +51,14 @@ class ClientResult:
 
 @dataclass(slots=True)
 class _Tracked:
+    """A task started with `start_task`, as the client has seen it so far."""
     url: str
     task_id: str
     state: TaskState = TaskState.SUBMITTED
     texts: list[str] = field(default_factory=list)
     data: list[Any] = field(default_factory=list)
     notice: str = ""
-    done: threading.Event = field(default_factory=threading.Event)
+    done: threading.Event = field(default_factory=threading.Event)   # set once settled
 
 
 def _settled(state: TaskState) -> bool:
@@ -72,22 +79,23 @@ class A2AClient:
 
     # --- blocking -----------------------------------------------------------
     def send_message(self, url: str, text: str, data: list[Any] | None = None) -> ClientResult:
+        """SendMessage: wait for the other agent's answer."""
         body = Request.send(self._message(text, data)).to_bytes()
         try:
-            resp = parse_response(self._send(url, body, version_headers()))
+            response = parse_response(self._send(url, body, version_headers()))
         except (ProtocolError, ConnectionError) as e:
             return ClientResult(TaskState.FAILED, notice=f"transport error: {e}")
-        if resp.error is not None:
-            return ClientResult(TaskState.FAILED, notice=resp.error.message)
-        return self._from_result(resp.result)
+        if response.error is not None:
+            return ClientResult(TaskState.FAILED, notice=response.error.message)
+        return self._from_result(response.result)
 
     @staticmethod
     def _from_result(res: Any) -> ClientResult:
         if isinstance(res, Task):
             texts, data = [], []
-            for a in res.artifacts:
-                texts += [p.text or "" for p in a.parts if p.kind == "text"]
-                data += [p.data for p in a.parts if p.kind == "data"]
+            for artifact in res.artifacts:
+                texts += [part.text or "" for part in artifact.parts if part.kind == "text"]
+                data += [part.data for part in artifact.parts if part.kind == "data"]
             notice = res.status.message.text() if res.status.message else ""
             return ClientResult(res.status.state, "\n".join(texts), data, res.id, notice)
         if isinstance(res, Message):                       # a direct answer, no task
@@ -114,7 +122,8 @@ class A2AClient:
         return self._snapshot(tracked)
 
     def _pump(self, tracked: _Tracked, stream: EventStream) -> None:
-        for body, _hdrs in stream:
+        """Background thread: apply every further event of the task's stream."""
+        for body, _headers in stream:
             self._apply(tracked, tracked.url, body)
         if not _settled(tracked.state):
             # the stream ended before the task settled: ask once more
@@ -122,48 +131,51 @@ class A2AClient:
         tracked.done.set()
 
     def _apply(self, tracked: _Tracked | None, url: str, body: bytes) -> _Tracked | None:
+        """Update what is known about a task from one response or event. With
+        `tracked` None (the first event), the task is created from the event."""
         try:
-            resp = parse_response(body)
+            response = parse_response(body)
         except ProtocolError:
             return tracked
-        res = resp.result
-        if resp.error is not None:
+        result = response.result
+        if response.error is not None:
             if tracked is not None:
-                tracked.state, tracked.notice = TaskState.FAILED, resp.error.message
+                tracked.state, tracked.notice = TaskState.FAILED, response.error.message
                 tracked.done.set()
             return tracked
-        if isinstance(res, Task):
+        if isinstance(result, Task):
             with self._lock:
-                tracked = tracked or self._tasks.get(res.id) or _Tracked(url=url, task_id=res.id)
-                self._tasks[res.id] = tracked
-            tracked.state = res.status.state
-            for a in res.artifacts:
-                self._collect(tracked, a.parts)
-            if res.status.message is not None:
-                tracked.notice = res.status.message.text()
-        elif isinstance(res, Message):                     # a message-only stream
+                tracked = tracked or self._tasks.get(result.id) or _Tracked(url=url, task_id=result.id)
+                self._tasks[result.id] = tracked
+            tracked.state = result.status.state
+            for artifact in result.artifacts:
+                self._collect(tracked, artifact.parts)
+            if result.status.message is not None:
+                tracked.notice = result.status.message.text()
+        elif isinstance(result, Message):                     # a message-only stream
             with self._lock:
-                tracked = tracked or _Tracked(url=url, task_id=res.task_id or res.message_id)
+                tracked = tracked or _Tracked(url=url, task_id=result.task_id or result.message_id)
                 self._tasks[tracked.task_id] = tracked
             tracked.state = TaskState.COMPLETED
-            self._collect(tracked, res.parts)
-        elif isinstance(res, StatusUpdate) and tracked is not None:
-            tracked.state = res.status.state
-            if res.status.message is not None:
-                tracked.notice = res.status.message.text()
-        elif isinstance(res, ArtifactUpdate) and tracked is not None:
-            self._collect(tracked, res.artifact.parts)
+            self._collect(tracked, result.parts)
+        elif isinstance(result, StatusUpdate) and tracked is not None:
+            tracked.state = result.status.state
+            if result.status.message is not None:
+                tracked.notice = result.status.message.text()
+        elif isinstance(result, ArtifactUpdate) and tracked is not None:
+            self._collect(tracked, result.artifact.parts)
         if tracked is not None and _settled(tracked.state):
             tracked.done.set()
         return tracked
 
     @staticmethod
     def _collect(tracked: _Tracked, parts: list[Part]) -> None:
-        for p in parts:
-            if p.kind == "text" and p.text and p.text not in tracked.texts:
-                tracked.texts.append(p.text)
-            elif p.kind == "data" and p.data not in tracked.data:
-                tracked.data.append(p.data)
+        """Add new content (a snapshot repeats what came before, so skip duplicates)."""
+        for part in parts:
+            if part.kind == "text" and part.text and part.text not in tracked.texts:
+                tracked.texts.append(part.text)
+            elif part.kind == "data" and part.data not in tracked.data:
+                tracked.data.append(part.data)
 
     def poll(self, task_id: str) -> ClientResult:
         """GetTask: the task's current state (an explicit dependency on it)."""
@@ -179,11 +191,14 @@ class A2AClient:
         return self._snapshot(tracked)
 
     def wait_task(self, task_id: str, timeout: float = 60.0) -> ClientResult:
+        """Wait (up to `timeout`) until the task has settled; return what is known."""
         with self._lock:
             tracked = self._tasks.get(task_id)
         if tracked is None:
             return ClientResult(TaskState.UNSPECIFIED, task_id=task_id, notice=f"unknown task {task_id}")
         if not tracked.done.is_set():
+            # Asking is an explicit dependency on the task: on a monitored host, a held
+            # task is resolved now rather than when its stall budget runs out.
             self.poll(task_id)
         deadline = time.monotonic() + timeout
         while not tracked.done.wait(timeout=0.25):

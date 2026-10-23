@@ -40,6 +40,8 @@ class Delivery(str, Enum):
 
 @dataclass(slots=True)
 class InterAgentMessage:
+    """One message on the inter-agent channel, in protocol-neutral terms: what the
+    monitor reasons about. `raw` keeps the parsed protocol object it came from."""
     kind: CommKind
     delivery: Delivery
     text: str = ""                                   # all content, as text
@@ -54,10 +56,13 @@ class InterAgentMessage:
 
     @property
     def has_content(self) -> bool:
+        """Does it carry anything to decide about? (A bare "working" status does not.)"""
         return bool(self.text.strip()) or bool(self.data)
 
 
 class ProtocolAdapter(Protocol):
+    """What the monitor needs from a protocol: parse traffic into InterAgentMessages,
+    render canonical forms, and render its own two answers."""
     name: str
 
     def parse_request(self, url: str, body: bytes | str | dict[str, Any]) -> InterAgentMessage: ...
@@ -71,30 +76,34 @@ class ProtocolAdapter(Protocol):
                  context_id: str | None = None) -> bytes: ...
 
 
-def _canonical_part(p: Part) -> Part:
+# --- canonical forms: what is kept of each type --------------------------------
+def _canonical_part(part: Part) -> Part:
     """A part as forwarded: its content, filename and media type (all checked as
     text); its free-form metadata is not forwarded (it was not checked)."""
-    return Part(kind=p.kind, text=p.text, raw=p.raw, url=p.url, data=p.data,
-                filename=p.filename, media_type=p.media_type)
+    return Part(kind=part.kind, text=part.text, raw=part.raw, url=part.url, data=part.data,
+                filename=part.filename, media_type=part.media_type)
 
 
-def _canonical_message(m: Message) -> Message:
-    return Message(role=m.role, parts=[_canonical_part(p) for p in m.parts], message_id=m.message_id,
-                   context_id=m.context_id, task_id=m.task_id)
+def _canonical_message(message: Message) -> Message:
+    """Role, parts and ids; no metadata, extensions or task references."""
+    return Message(role=message.role, parts=[_canonical_part(part) for part in message.parts],
+                   message_id=message.message_id, context_id=message.context_id, task_id=message.task_id)
 
 
-def _canonical_status(s: TaskStatus) -> TaskStatus:
-    return TaskStatus(s.state, message=_canonical_message(s.message) if s.message else None,
-                      timestamp=s.timestamp)
+def _canonical_status(status: TaskStatus) -> TaskStatus:
+    return TaskStatus(status.state, message=_canonical_message(status.message) if status.message else None,
+                      timestamp=status.timestamp)
 
 
-def _canonical_artifact(a: Artifact) -> Artifact:
-    return Artifact(parts=[_canonical_part(p) for p in a.parts], artifact_id=a.artifact_id)
+def _canonical_artifact(artifact: Artifact) -> Artifact:
+    """Parts and id; no name, description or metadata."""
+    return Artifact(parts=[_canonical_part(part) for part in artifact.parts], artifact_id=artifact.artifact_id)
 
 
-def _canonical_task(t: Task) -> Task:
-    return Task(id=t.id, context_id=t.context_id, status=_canonical_status(t.status),
-                artifacts=[_canonical_artifact(a) for a in t.artifacts])
+def _canonical_task(task: Task) -> Task:
+    """Id, context, status and artifacts; no history and no metadata."""
+    return Task(id=task.id, context_id=task.context_id, status=_canonical_status(task.status),
+                artifacts=[_canonical_artifact(artifact) for artifact in task.artifacts])
 
 
 class A2AAdapter:
@@ -103,40 +112,46 @@ class A2AAdapter:
     name = "a2a/1.0"
 
     def parse_request(self, url: str, body: bytes | str | dict[str, Any]) -> InterAgentMessage:
-        req = parse_request(body)
-        if req.method in (Method.SEND, Method.STREAM):
-            msg = req.message
-            assert msg is not None                     # parse_request requires it
+        """What an outgoing request is, in the monitor's terms. Raises ProtocolError
+        for anything that is not a well-formed A2A v1.0 request."""
+        request = parse_request(body)
+        if request.method in (Method.SEND, Method.STREAM):
+            message = request.message
+            assert message is not None                     # parse_request requires it
             # SendMessage with returnImmediately answers at once with a task in
             # progress: for the caller that is a task it polls later
-            blocking = req.method is Method.SEND and not req.return_immediately
+            blocking = request.method is Method.SEND and not request.return_immediately
             return InterAgentMessage(
                 kind=CommKind.REQUEST,
                 delivery=Delivery.BLOCKING if blocking else Delivery.STREAMING,
-                text=msg.content_text(), data=msg.data(), target_url=url,
-                task_id=msg.task_id, context_id=msg.context_id,
-                protocol_message_id=msg.message_id, raw=req)
-        if req.method in (Method.GET_TASK, Method.SUBSCRIBE):
+                text=message.content_text(), data=message.data(), target_url=url,
+                task_id=message.task_id, context_id=message.context_id,
+                protocol_message_id=message.message_id, raw=request)
+        if request.method in (Method.GET_TASK, Method.SUBSCRIBE):
             return InterAgentMessage(kind=CommKind.POLL, delivery=Delivery.STREAMING,
-                                     target_url=url, task_id=req.task_id, raw=req)
-        if req.method is Method.CANCEL_TASK:
+                                     target_url=url, task_id=request.task_id, raw=request)
+        if request.method is Method.CANCEL_TASK:
             return InterAgentMessage(kind=CommKind.CONTROL, delivery=Delivery.BLOCKING,
-                                     target_url=url, task_id=req.task_id, raw=req)
+                                     target_url=url, task_id=request.task_id, raw=request)
         return InterAgentMessage(kind=CommKind.UNSUPPORTED, delivery=Delivery.BLOCKING,
-                                 target_url=url, raw=req)
+                                 target_url=url, raw=request)
 
     def parse_replies(self, body: bytes | str | dict[str, Any], *,
                       streaming: bool = False) -> list[InterAgentMessage]:
+        """A response (or, with `streaming`, a complete SSE body) as REPLY messages."""
         responses = parse_sse(body) if streaming else [parse_response(body)]
-        return [self._reply(r) for r in responses]
+        return [self._reply(response) for response in responses]
 
     def reply_from_result(self, result: Result) -> InterAgentMessage:
         return self._reply(Response(id=None, result=result))
 
     @staticmethod
     def _reply(resp: Response) -> InterAgentMessage:
-        res = resp.result
-        if res is None:
+        """The monitor's view of one response: its content as text and data, the task
+        it belongs to, and whether the task has settled (`final`: terminal, or waiting
+        for the caller)."""
+        result = resp.result
+        if result is None:
             return InterAgentMessage(kind=CommKind.REPLY, delivery=Delivery.BLOCKING,
                                      text=resp.error.message if resp.error else "",
                                      state=TaskState.FAILED, raw=resp)
@@ -144,26 +159,26 @@ class A2AAdapter:
         state: TaskState | None = None
         final = True
         data: list[Any] = []
-        if isinstance(res, Task):
-            task_id, context_id, state = res.id, res.context_id, res.status.state
+        if isinstance(result, Task):
+            task_id, context_id, state = result.id, result.context_id, result.status.state
             final = state.is_final or state.is_interrupted
-            for a in res.artifacts:
-                data += [p.data for p in a.parts if p.kind == "data"]
-        elif isinstance(res, StatusUpdate):
-            task_id, context_id, state = res.task_id, res.context_id, res.status.state
+            for artifact in result.artifacts:
+                data += [part.data for part in artifact.parts if part.kind == "data"]
+        elif isinstance(result, StatusUpdate):
+            task_id, context_id, state = result.task_id, result.context_id, result.status.state
             final = state.is_final or state.is_interrupted
-        elif isinstance(res, ArtifactUpdate):
-            task_id, context_id, final = res.task_id, res.context_id, False
-            data = [p.data for p in res.artifact.parts if p.kind == "data"]
-        elif isinstance(res, Message):
-            task_id, context_id = res.task_id, res.context_id
-            data = res.data()
-        elif isinstance(res, TaskList):
-            for t in res.tasks:
-                for a in t.artifacts:
-                    data += [p.data for p in a.parts if p.kind == "data"]
+        elif isinstance(result, ArtifactUpdate):
+            task_id, context_id, final = result.task_id, result.context_id, False
+            data = [part.data for part in result.artifact.parts if part.kind == "data"]
+        elif isinstance(result, Message):
+            task_id, context_id = result.task_id, result.context_id
+            data = result.data()
+        elif isinstance(result, TaskList):
+            for task in result.tasks:
+                for artifact in task.artifacts:
+                    data += [part.data for part in artifact.parts if part.kind == "data"]
         return InterAgentMessage(kind=CommKind.REPLY, delivery=Delivery.BLOCKING,
-                                 text=result_text(res), data=data, task_id=task_id,
+                                 text=result_text(result), data=data, task_id=task_id,
                                  context_id=context_id, final=final, state=state, raw=resp)
 
     # --- canonical forms: forward exactly what was decided --------------------
@@ -174,22 +189,25 @@ class A2AAdapter:
         metadata, extensions, unknown params, its own message id, task and context ids
         the monitor cannot map -- are not forwarded: they would carry content past the
         decision. `task_id` / `context_id` are the PEER's ids the monitor mapped."""
-        req = msg.raw
-        assert isinstance(req, Request)
-        m = req.message
-        parts = [_canonical_part(p) for p in m.parts] if m is not None else []
-        out = Message(role="user", parts=parts, message_id=new_id("msg-"),
-                      context_id=context_id, task_id=task_id)
-        params: dict[str, Any] = {"message": out.to_dict()}
-        if req.method is Method.SEND and msg.delivery is Delivery.STREAMING:
+        request = msg.raw
+        assert isinstance(request, Request)
+        original = request.message
+        parts = [_canonical_part(part) for part in original.parts] if original is not None else []
+        # A fresh message id: the agent's own id is free text it chose.
+        canonical = Message(role="user", parts=parts, message_id=new_id("msg-"),
+                            context_id=context_id, task_id=task_id)
+        params: dict[str, Any] = {"message": canonical.to_dict()}
+        if request.method is Method.SEND and msg.delivery is Delivery.STREAMING:
             params["configuration"] = {"returnImmediately": True}
-        return Request(method=req.method, params=params, id=req.id).to_bytes()
+        return Request(method=request.method, params=params, id=request.id).to_bytes()
 
     @staticmethod
     def canonical_poll(msg: InterAgentMessage, remote_task_id: str) -> bytes:
-        req = msg.raw
-        assert isinstance(req, Request)
-        return Request(method=req.method, params={"id": remote_task_id}, id=req.id).to_bytes()
+        """A GetTask / SubscribeToTask / CancelTask that carries nothing but the peer's
+        task id."""
+        request = msg.raw
+        assert isinstance(request, Request)
+        return Request(method=request.method, params={"id": remote_task_id}, id=request.id).to_bytes()
 
     def canonical_reply(self, body: bytes | str | dict[str, Any]) -> tuple[bytes, InterAgentMessage] | None:
         """A reply re-serialized from its checked view (artifact parts, status and its
@@ -197,30 +215,36 @@ class A2AAdapter:
         view. None when the body is not a well-formed A2A v1.0 response: fail closed,
         never pass it on."""
         try:
-            resp = parse_response(body)
+            response = parse_response(body)
         except ProtocolError:
             return None
-        res = resp.result
-        canon: Response
-        if resp.error is not None:
-            canon = Response(id=resp.id, error=RpcError(resp.error.code, resp.error.message))
-        elif isinstance(res, Task):
-            canon = Response(id=resp.id, result=_canonical_task(res), bare=resp.bare)
-        elif isinstance(res, Message):
-            canon = Response(id=resp.id, result=_canonical_message(res))
-        elif isinstance(res, StatusUpdate):
-            canon = Response(id=resp.id, result=StatusUpdate(res.task_id, res.context_id,
-                                                             _canonical_status(res.status)))
-        elif isinstance(res, ArtifactUpdate):
-            canon = Response(id=resp.id, result=ArtifactUpdate(
-                res.task_id, res.context_id, _canonical_artifact(res.artifact), res.append, res.last_chunk))
-        elif isinstance(res, TaskList):
-            canon = Response(id=resp.id, result=TaskList([_canonical_task(t) for t in res.tasks],
-                                                         res.next_page_token, res.page_size, res.total_size),
-                             bare=True)
+        result = response.result
+        canonical: Response
+        if response.error is not None:
+            # An error keeps its code and message; its structured `data` could carry
+            # anything, so it is dropped.
+            canonical = Response(id=response.id, error=RpcError(response.error.code, response.error.message))
+        elif isinstance(result, Task):
+            canonical = Response(id=response.id, result=_canonical_task(result), bare=response.bare)
+        elif isinstance(result, Message):
+            canonical = Response(id=response.id, result=_canonical_message(result))
+        elif isinstance(result, StatusUpdate):
+            canonical = Response(id=response.id, result=StatusUpdate(result.task_id, result.context_id,
+                                                                     _canonical_status(result.status)))
+        elif isinstance(result, ArtifactUpdate):
+            canonical = Response(id=response.id, result=ArtifactUpdate(
+                result.task_id, result.context_id, _canonical_artifact(result.artifact), result.append,
+                result.last_chunk))
+        elif isinstance(result, TaskList):
+            canonical = Response(id=response.id,
+                                 result=TaskList([_canonical_task(task) for task in result.tasks],
+                                                 result.next_page_token, result.page_size, result.total_size),
+                                 bare=True)
         else:
             return None
-        return canon.to_bytes(), self._reply(canon)
+        # The view is taken from the canonical form: the decision is made on exactly
+        # what will be sent.
+        return canonical.to_bytes(), self._reply(canonical)
 
     # --- what the monitor answers itself -----------------------------------
     def working(self, request: InterAgentMessage, task_id: str, *, context_id: str | None = None) -> bytes:

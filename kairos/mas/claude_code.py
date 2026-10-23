@@ -27,6 +27,7 @@ from types import SimpleNamespace
 from typing import Any
 
 CLAUDE_CODE = "claude-code"
+# Error texts that mean "retrying will not help" (quota or login problems).
 _NO_RETRY = ("usage limit", "limit reached", "credit balance", "invalid api key", "not logged in",
              "please run /login", "authentication")
 
@@ -93,11 +94,19 @@ class ClaudeCodeChatClient:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
     def command(self, system: str) -> list[str]:
-        cmd = [self.binary, "-p", "--output-format", "json", "--tools", "", "--strict-mcp-config",
-               "--setting-sources", "", "--no-session-persistence", "--system-prompt", system]
+        """The CLI call for one judge turn. Each flag removes something Claude Code
+        would otherwise bring along:"""
+        cmd = [self.binary,
+               "-p", "--output-format", "json",   # one headless turn; the answer as JSON
+               "--tools", "",                     # no tools: the judge only reads and answers
+               "--strict-mcp-config",             # no MCP servers (none are configured here)
+               "--setting-sources", "",           # no user/project settings, so no hooks
+               "--no-session-persistence",        # nothing saved to the user's session history
+               "--system-prompt", system]         # the oracle's prompt instead of Claude Code's
         if self.model:
             cmd += ["--model", self.model]
         if self.json_schema is not None:
+            # The answer is validated against the schema and returned as an object.
             cmd += ["--json-schema", json.dumps(self.json_schema)]
         return cmd
 
@@ -112,34 +121,38 @@ class ClaudeCodeChatClient:
         for attempt in range(self.retries + 1):
             if attempt:
                 time.sleep(self.backoff * attempt)
-            t0 = time.monotonic()
+            started = time.monotonic()
             try:
                 with self._slots:
-                    out = subprocess.run(self.command(system), input=prompt, capture_output=True, text=True,
-                                         timeout=self.timeout, cwd=self._cwd)
+                    # The prompt goes in on stdin (it can be long); the working directory
+                    # is an empty temporary one, so no project context is picked up.
+                    completed = subprocess.run(self.command(system), input=prompt, capture_output=True,
+                                               text=True, timeout=self.timeout, cwd=self._cwd)
             except (OSError, subprocess.TimeoutExpired) as e:
                 error = f"{type(e).__name__}: {e}"
                 continue
             try:
-                d = json.loads(out.stdout)
+                answer = json.loads(completed.stdout)
             except ValueError:
-                d = {}
-            if isinstance(d, dict) and not d.get("is_error") and out.returncode == 0 \
-                    and isinstance(d.get("result"), str):
-                return self._completion(d, time.monotonic() - t0)
-            error = str((d.get("result") if isinstance(d, dict) else None) or out.stderr.strip()
-                        or f"exit status {out.returncode}")[:500]
-            if any(k in error.lower() for k in _NO_RETRY):
+                answer = {}
+            if isinstance(answer, dict) and not answer.get("is_error") and completed.returncode == 0 \
+                    and isinstance(answer.get("result"), str):
+                return self._completion(answer, time.monotonic() - started)
+            error = str((answer.get("result") if isinstance(answer, dict) else None)
+                        or completed.stderr.strip() or f"exit status {completed.returncode}")[:500]
+            # An exhausted quota or a missing login will not fix itself by retrying.
+            if any(marker in error.lower() for marker in _NO_RETRY):
                 break
         with self._lock:
             self.usage.errors.append(error)
         raise ClaudeCodeError(f"claude -p failed: {error}")
 
     def _completion(self, d: dict[str, Any], seconds: float) -> Any:
-        u = d.get("usage") or {}
-        prompt_tokens = sum(int(u.get(k) or 0) for k in
+        """Account for one answer and wrap it like an OpenAI chat completion."""
+        usage = d.get("usage") or {}
+        prompt_tokens = sum(int(usage.get(key) or 0) for key in
                             ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-        completion_tokens = int(u.get("output_tokens") or 0)
+        completion_tokens = int(usage.get("output_tokens") or 0)
         models = list((d.get("modelUsage") or {}).keys())
         with self._lock:
             self.usage.calls += 1
@@ -151,10 +164,11 @@ class ClaudeCodeChatClient:
         structured = d.get("structured_output")
         content = json.dumps(structured) if isinstance(structured, dict) else d["result"]
         message = SimpleNamespace(content=content, role="assistant", tool_calls=None, model_extra={})
-        usage = SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                                total_tokens=prompt_tokens + completion_tokens, completion_tokens_details=None)
+        token_usage = SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                                      total_tokens=prompt_tokens + completion_tokens,
+                                      completion_tokens_details=None)
         return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop", index=0)],
-                               usage=usage, model=models[0] if models else (self.model or CLAUDE_CODE),
+                               usage=token_usage, model=models[0] if models else (self.model or CLAUDE_CODE),
                                id=d.get("session_id"))
 
 

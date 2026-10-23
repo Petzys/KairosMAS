@@ -49,6 +49,7 @@ class AgentLabels:
 
 @dataclass(slots=True)
 class AgentSpec:
+    """One agent: its cluster, its A2A endpoint, and how its data is labeled."""
     id: str
     cluster: str
     endpoint: str
@@ -76,6 +77,7 @@ class PeerBook:
 
 @dataclass(slots=True)
 class ClusterPolicy:
+    """Who may receive which data from this cluster's members (the release policy)."""
     default_action: Decision = Decision.REVIEW
     navigational_get: str = "allow"
     # payload identifiers of EXTERNAL effects (the single-agent knob, default off)
@@ -93,6 +95,7 @@ class ClusterPolicy:
 
 @dataclass(slots=True)
 class ClusterSpec:
+    """A cluster: the unit of containment (see the module docstring)."""
     id: str
     clearance: Level = Level.LOW          # default clearance of this cluster as a destination
     description: str = ""
@@ -100,11 +103,15 @@ class ClusterSpec:
 
 
 def default_endpoint(agent: str, cluster: str) -> str:
+    """The endpoint an agent gets when the spec names none, e.g.
+    `http://payments.finance.mas.local/a2a`."""
     host = f"{agent}.{cluster}.mas.local".replace("_", "-").lower()
     return f"http://{host}/a2a"
 
 
 def endpoint_origin(url: str) -> str:
+    """scheme://host:port of a URL: an agent is identified by its origin, so any path
+    at its endpoint reaches it (as over HTTP)."""
     try:
         return URL(url if "://" in url else f"http://{url}").origin
     except Exception:
@@ -113,6 +120,8 @@ def endpoint_origin(url: str) -> str:
 
 @dataclass(slots=True)
 class MASSpec:
+    """The whole system: its agents, its clusters, and the entry agent that receives
+    the principal's prompt."""
     name: str
     entry: str
     agents: dict[str, AgentSpec]
@@ -122,7 +131,7 @@ class MASSpec:
 
     # --- topology -------------------------------------------------------------
     def members(self, cluster: str) -> list[str]:
-        return [a.id for a in self.agents.values() if a.cluster == cluster]
+        return [agent.id for agent in self.agents.values() if agent.cluster == cluster]
 
     def cluster_of(self, agent: str) -> ClusterSpec:
         return self.clusters[self.agents[agent].cluster]
@@ -133,9 +142,9 @@ class MASSpec:
     def agent_at(self, url: str) -> str | None:
         """The agent whose A2A endpoint `url` addresses (None: not part of the system)."""
         origin = endpoint_origin(url)
-        for a in self.agents.values():
-            if endpoint_origin(a.endpoint) == origin:
-                return a.id
+        for agent in self.agents.values():
+            if endpoint_origin(agent.endpoint) == origin:
+                return agent.id
         return None
 
     def peer_clearance(self, sender: str, dest: str) -> tuple[Level | None, bool]:
@@ -143,26 +152,26 @@ class MASSpec:
         cluster. Intra-cluster destinations are not looked up (never gated)."""
         book = self.cluster_of(sender).policy.peers
         dest_cluster = self.agents[dest].cluster
-        for e in book.entries:                      # per-agent override first
-            if e.agent == dest:
-                return (e.max_level or self.clusters[dest_cluster].clearance), True
-        for e in book.entries:
-            if e.cluster == dest_cluster:
-                return (e.max_level or self.clusters[dest_cluster].clearance), True
+        for entry in book.entries:                  # per-agent override first
+            if entry.agent == dest:
+                return (entry.max_level or self.clusters[dest_cluster].clearance), True
+        for entry in book.entries:
+            if entry.cluster == dest_cluster:
+                return (entry.max_level or self.clusters[dest_cluster].clearance), True
         return None, False
 
     # --- effective single-agent policy ----------------------------------------
     def agent_policy(self, agent: str) -> Policy:
         """The KAIROS policy one agent's external effects are evaluated under: its
         own labels joined with its cluster's release policy."""
-        a = self.agents[agent]
-        c = self.clusters[a.cluster]
-        cp = c.policy
-        ctx = Context(
-            name=agent, default_action=cp.default_action,
-            revertable=list(a.labels.revertable), non_revertable=list(a.labels.non_revertable),
-            description=a.description, scope=f"mas:{self.name}/{c.id}",
-            navigational_get=cp.navigational_get, embedded_identifiers=cp.embedded_identifiers)
-        res = Resources(contact_book=cp.external, taints=list(a.labels.taints),
-                        trusted_sources=list(a.labels.trusted_sources))
-        return Policy(version=self.version, context=ctx, resources=res, rules=list(cp.rules))
+        member = self.agents[agent]
+        cluster = self.clusters[member.cluster]
+        release = cluster.policy
+        context = Context(
+            name=agent, default_action=release.default_action,
+            revertable=list(member.labels.revertable), non_revertable=list(member.labels.non_revertable),
+            description=member.description, scope=f"mas:{self.name}/{cluster.id}",
+            navigational_get=release.navigational_get, embedded_identifiers=release.embedded_identifiers)
+        resources = Resources(contact_book=release.external, taints=list(member.labels.taints),
+                              trusted_sources=list(member.labels.trusted_sources))
+        return Policy(version=self.version, context=context, resources=resources, rules=list(release.rules))
