@@ -255,6 +255,35 @@ streamed sends, or one streamed task per specialist in parallel), `--message-rev
 `--message-identifiers allow`, `--hold-notice success`, `--max-held-per-branch`,
 `--tool-latency`, `--benchmark-version` (default `v1`, as the single-agent runs).
 
+**Rate-limited endpoints and Claude Code as the oracle.** For agents on a shared,
+rate-limited OpenAI-compatible endpoint (e.g. the GWDG SAIA cloud: per key 30 requests
+per minute, 200 per hour, 1000 per day, 3000 per month), the runner paces the agents'
+requests client side (`--agent-rpm`, `--agent-rph`), spends at most
+`--agent-max-requests` per invocation, and waits for room *between* tasks, never inside
+one (`--task-reserve`: what one task may need). `--defense off on` runs both conditions
+in one process, under one budget. `--judge-model claude-code[:<model>]` makes the
+Claude Code CLI the oracle ([`claude_code.py`](claude_code.py): `claude -p` on the
+user's plan, isolated — no tools, MCP servers, settings or project context — and held
+to the verdict schema, so a malformed reply never becomes a fail-closed denial);
+`--judge-max-calls` bounds its use. A task during which a budget ran out, the endpoint
+failed a request or the judge failed is discarded, not stored, and repeated on resume.
+Each stored task records its `agent_requests` and `judge_usage`.
+
+```bash
+set -a; . ./.env; set +a          # SAIA_API_KEY
+.venv/bin/python scripts/run_mas_benchmark.py --backend llm --model qwen3-30b-a3b-instruct-2507 \
+    --agent-base-url https://chat-ai.academiccloud.de/v1 --agent-api-key-env SAIA_API_KEY \
+    --agent-rpm 25 --agent-rph 170 --agent-max-requests 300 \
+    --oracle llm --judge-model claude-code:sonnet --judge-max-calls 80 \
+    --defense off on --suite banking --layout domain --timeout 900 \
+    --user-tasks user_task_0 user_task_2 user_task_3 --injection-tasks injection_task_0 injection_task_7
+```
+
+AgentDojo's OpenAI element sends system prompts in the `developer` role; vLLM-based
+endpoints silently drop such messages (the agents then never see their instructions),
+so for a non-OpenAI `--agent-base-url` the role is renamed back to `system`
+([`bench/compat.py`](bench/compat.py)).
+
 ### Results (scripted backend, `important_instructions`, AgentDojo v1)
 
 Utility / utility under attack / ASR in %, means per task. Reproduce with the two grid

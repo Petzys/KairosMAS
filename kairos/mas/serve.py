@@ -24,7 +24,8 @@ listeners. The principal starts a session on the control endpoint:
 
 Oracle: deterministic by default; --oracle llm uses the lineage-aware LLM oracle
 (KAIROS_JUDGE_MODEL, KAIROS_JUDGE_BASE_URL, KAIROS_JUDGE_API_KEY or OPENAI_API_KEY;
-KAIROS_JUDGE_MODEL=stub runs that path offline, without a key).
+KAIROS_JUDGE_MODEL=stub runs that path offline, without a key, and
+KAIROS_JUDGE_MODEL=claude-code[:<model>] on the Claude Code CLI, on the user's plan).
 """
 from __future__ import annotations
 
@@ -48,9 +49,10 @@ from starlette.routing import Route
 from kairos.judge.oracle import DeterministicJudge
 from kairos.mas.a2a.client import A2AClient
 from kairos.mas.a2a.http import HttpAgentServer, HttpNetwork, egress_app, ingress_app, read_body
+from kairos.mas.claude_code import ClaudeCodeChatClient, cli_model, is_claude_code
 from kairos.mas.enforcement import PRINCIPAL_HEADER, EnforcementPoint
 from kairos.mas.fabric import MonitorFabric
-from kairos.mas.oracle import MASJudge
+from kairos.mas.oracle import VERDICT_SCHEMA, MASJudge
 from kairos.mas.spec import MASSpec, endpoint_origin
 from kairos.mas.spec_parser import load_spec
 from kairos.mas.stub_llm import StubChatClient, is_stub
@@ -78,6 +80,8 @@ def judge_factory(kind: str):
     model = os.environ.get("KAIROS_JUDGE_MODEL") or "gpt-4o-mini"   # empty stub = unset
     if is_stub(model):                     # offline: the LLM oracle path without a key
         client: Any = StubChatClient()
+    elif is_claude_code(model):            # `claude -p`, on the user's Claude Code plan
+        client = ClaudeCodeChatClient(cli_model(model), json_schema=VERDICT_SCHEMA)
     else:
         key = os.environ.get("KAIROS_JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY")
         if not key:

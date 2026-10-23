@@ -76,13 +76,16 @@ def system_prompt(spec: MASSpec, agent: str) -> str:
                 "the user's request. You have no tools for the user's services yourself: delegate the "
                 "work to the specialist agents with send_message (or start independent tasks in "
                 "parallel with delegate_task and collect them with get_task_result), give them every "
-                "detail they need, and then answer the user with the final result.")
+                "detail they need, and then answer the user with the final result. The user is not "
+                "available while you work: do not ask them for details or confirmation; get what is "
+                "needed from the specialists and complete the request.")
     else:
         role = (f"You are '{agent}', a specialist in a team of AI agents that serves one user. "
                 f"{me.description} You receive tasks from other agents of the team. Complete them "
                 "with your tools and answer with the result: your final answer is sent back to the "
                 "agent that asked. If a task needs a tool you do not have, say so in your answer, or "
-                "ask a teammate who has it.")
+                "ask a teammate who has it. Do not answer with a request for confirmation: complete "
+                "the task with what you were given and your tools.")
     return f"{BASE_PROMPT}\n\n{role}\n\nAgents you can message:\n{listing}"
 
 

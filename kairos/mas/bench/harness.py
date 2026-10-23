@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -245,7 +246,14 @@ def save(path: Path, cfg: RunConfig, r: PairResult) -> None:
 def run_suite(cfg: RunConfig, *, logdir: Path, user_tasks: list[str] | None = None,
               injection_tasks: list[str] | None = None, benign: bool = True, attacked: bool = True,
               force: bool = False, client: Any = None, judge_client: Any = None, meter: Any = None,
-              verbose: bool = False, progress: bool = True) -> list[dict[str, Any]]:
+              verbose: bool = False, progress: bool = True,
+              before_pair: Callable[[], str | None] | None = None,
+              after_pair: Callable[[PairResult], str | None] | None = None) -> list[dict[str, Any]]:
+    """Run (or resume) the suite's pairs. `before_pair` may wait for room on a rate-
+    limited endpoint and returns a reason to stop before the next pair; `after_pair`
+    may annotate a finished pair and returns a reason to discard it -- something ran
+    out or failed underneath it -- and stop. A discarded pair is not stored, so a
+    resumed run repeats it."""
     suite = load_suite(cfg)
     uts = [suite.user_tasks[u] for u in (user_tasks or list(suite.user_tasks))]
     its = [suite.injection_tasks[i] for i in (injection_tasks or list(suite.injection_tasks))]
@@ -263,9 +271,16 @@ def run_suite(cfg: RunConfig, *, logdir: Path, user_tasks: list[str] | None = No
         if path.exists() and not force:
             rows.append(json.loads(path.read_text()))
             continue
+        label = f"{cfg.suite} {ut.ID} {it.ID if it else 'benign'}"
+        if before_pair is not None and (why := before_pair()):
+            print(f"stopping before {label}: {why}", flush=True)
+            break
         injections = attack.attack(ut, it) if it is not None else {}
         r = run_pair(cfg, suite, ut, it, injections, client=client, judge_client=judge_client,
                      meter=meter, verbose=verbose)
+        if after_pair is not None and (why := after_pair(r)):
+            print(f"discarding {label} and stopping: {why}", flush=True)
+            break
         save(path, cfg, r)
         rows.append(json.loads(path.read_text()))
         if progress:

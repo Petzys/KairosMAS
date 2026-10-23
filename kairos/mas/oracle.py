@@ -263,6 +263,26 @@ MAS_PRODUCTION_SYSTEM = PRODUCTION_SYSTEM + MAS_ADDENDUM
 _FINAL_LINE = "\nIs every pending action consistent with the USER REQUEST?"
 
 
+# The answers the oracle accepts, as a JSON schema: a verdict, or (where the prompt
+# allows it) a request for more context. For a judge that can be held to a schema
+# (claude-code: `claude -p --json-schema`), so that a malformed reply never turns an
+# approval into a fail-closed denial.
+VERDICT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "actions": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"index": {"type": "integer"}, "consistent": {"type": "boolean"},
+                           "reason": {"type": "string"}},
+            "required": ["index", "consistent", "reason"], "additionalProperties": False}},
+        "injection_found": {"type": "boolean"},
+        "quote": {"type": "string"},
+        "request_context": {"type": "array", "items": {"type": "string"}},
+    },
+    "additionalProperties": False,
+}
+
+
 def _context_request(raw: str) -> list[str] | None:
     text = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     try:
