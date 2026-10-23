@@ -1,10 +1,27 @@
 <!doctype html>
+<!--
+  The KAIROS MAS run viewer: replays one recorded run (a flight trace from
+  kairos/mas/trace.py) as an animation of the system.
+
+  Served by `python -m kairos.mas.viewer serve <logdir>` (the page then fetches the
+  run list from api/runs and a run's trace from api/trace?path=...), or exported as
+  a self-contained page by `python -m kairos.mas.viewer export <result.json>` (the
+  trace is then embedded in <script id="trace-data">).
+
+  Layout: a header (run info, policies, open a file, theme), the run browser on the
+  left (serve mode), the stage in the middle (an SVG of the principal, the clusters
+  with their agents, the outside world and the oracle) with the playback controls
+  under it, and on the right the event list with category filters and the detail of
+  the selected event (or of a policy).
+-->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>KAIROS MAS Run Viewer</title>
 <style>
+/* Colours as CSS variables; the dark theme (system setting or the theme button)
+   redefines them below. */
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #677085; --line: #d9dde5;
   --cluster: #eef2f8; --cluster-line: #b9c3d6; --agent: #ffffff;
@@ -157,6 +174,13 @@ svg text { fill: var(--ink); font-family: system-ui, sans-serif; pointer-events:
 <script id="trace-data" type="application/json">null</script>
 <script>
 "use strict";
+// How the page works
+//   A trace is a list of events in order (run, agent reasoning, tool calls,
+//   messages, monitor decisions, oracle calls). The page keeps no history: the state
+//   after n events is the result of applying the first n events to a fresh state
+//   (stateAt), so stepping back and scrubbing are exact. Stepping forward applies just
+//   the next event and starts its animation (spawnAnims). draw() renders the stage
+//   from the current state; the event list and the detail pane are plain HTML.
 // ---------------------------------------------------------------- vocabulary
 const CATS = {
   run:       {label: "run",        kinds: ["run.start", "run.end"]},
@@ -177,6 +201,7 @@ const ICON = {
 const DEC_COLOR = {ALLOW: "var(--green)", REVIEW: "var(--amber)", DENY: "var(--red)"};
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
+// Event kinds grouped into the categories the filters show and hide.
 // ---------------------------------------------------------------- state
 let T = null;            // the trace
 let L = null;            // layout
@@ -189,6 +214,9 @@ const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&
 const short = (s, n = 90) => { s = String(s ?? "").replace(/\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
 
 // ---------------------------------------------------------------- layout
+// Where everything sits on the 1000x640 stage: the clusters side by side with their
+// agents stacked inside, the principal on top, the outside world and the oracle at
+// the bottom. Each agent box has its enforcement point ("ep") in a corner.
 function layout(trace) {
   const topo = trace.topology, W = 1000;
   const clusters = topo.clusters, n = clusters.length;
@@ -215,6 +243,9 @@ function layout(trace) {
 }
 
 // ---------------------------------------------------------------- replay state
+// The replayed state: per agent its status, last gate decision, flag and last action;
+// per cluster its resolutions; the messages on hold; counters; the latest external
+// effects; the oracle's current review.
 function freshState() {
   const st = {agents: {}, clusters: {}, held: {}, counts: {rel: 0, held: 0, rej: 0, exec: 0, toolHeld: 0,
     blocked: 0, oracle: 0, aborted: 0}, ext: [], oracle: {busy: null, last: null}, end: null, msgText: {}};
@@ -224,6 +255,7 @@ function freshState() {
   return st;
 }
 
+// Apply one event to the state (the only place the state changes).
 function apply(st, e) {
   const A = e.agent && st.agents[e.agent];
   switch (e.kind) {
@@ -259,6 +291,7 @@ function apply(st, e) {
   }
 }
 
+// The state after the first n events, computed from scratch.
 function stateAt(n) { const st = freshState(); for (let i = 0; i < n; i++) apply(st, T.events[i]); return st; }
 
 // ---------------------------------------------------------------- drawing
@@ -433,6 +466,9 @@ function wrap(s, n) {
 }
 
 // ---------------------------------------------------------------- animations
+// The animation of one event: tokens that travel across the stage (a prompt, a tool
+// call to the outside world, a message across a cluster boundary, a review to the
+// oracle). A token that is held, rejected or blocked stops at the boundary.
 function spawnAnims(e) {
   const tok = (from, to, color, text, opts = {}) => anims.push({from, to, color, text, t0: performance.now(), dur: opts.dur || stepMs() * 0.85, stop: opts.stop, x: opts.x});
   const ag = a => agentPoint(a), ep = a => agentPoint(a, "ep");
@@ -486,6 +522,8 @@ function kick() { if (!raf) raf = requestAnimationFrame(animate); }
 // ---------------------------------------------------------------- playback
 function visibleNext(from) { for (let i = from; i < T.events.length; i++) if (!hidden.has(CAT_OF[T.events[i].kind])) return i; return T.events.length - 1; }
 function visiblePrev(from) { for (let i = from; i >= 0; i--) if (!hidden.has(CAT_OF[T.events[i].kind])) return i; return -1; }
+// Show the state after n events. One step forward is applied incrementally and
+// animated; any other move recomputes the state from scratch (no animation).
 function goTo(n, animateIt) {
   n = Math.max(0, Math.min(T.events.length, n));
   if (animateIt && n === idx + 1) { apply(S, T.events[idx]); idx = n; spawnAnims(T.events[n - 1]); }
@@ -500,6 +538,8 @@ function goTo(n, animateIt) {
 }
 function stepForward() { if (idx >= T.events.length) { pause(); return; } goTo(visibleNext(idx) + 1, true); }
 function stepBack() { const p = visiblePrev(idx - 2); goTo(p + 1, false); }
+// While playing: the pause before the next step -- uniform, or (timing "recorded")
+// the time that passed between the two events in the run, clamped to 60 ms..4 s.
 function delayToNext() {
   if ($("timing").value === "steps" || idx === 0 || idx >= T.events.length) return stepMs();
   const n = visibleNext(idx), dt = (T.events[n].t - T.events[idx - 1].t) * 1000;
@@ -577,6 +617,8 @@ function renderListState() {
   if (cur && cur.style.display !== "none") cur.scrollIntoView({block: "nearest"});
 }
 
+// Text to highlight in event details: the usual injection markers and the attacker's
+// values (accounts, addresses, URLs, ids) found in the injection task's goal.
 let MARKS = [];
 function markers() {
   const pats = ["<INFORMATION>", "</INFORMATION>", "important message from me", "ignore previous instructions", "ignore all previous instructions"];
@@ -696,6 +738,7 @@ function renderInfo() {
   $("runinfo").innerHTML = parts.join(" ");
 }
 
+// Show a trace: lay out its system, reset the replay, render the panels.
 function load(trace) {
   pause();
   T = trace; L = layout(T); markers(); policyView = null; S = freshState(); idx = 0; anims = [];
@@ -791,6 +834,7 @@ wrapEl.addEventListener("dragover", ev => { ev.preventDefault(); $("drop").style
 wrapEl.addEventListener("dragleave", () => $("drop").style.display = "none");
 wrapEl.addEventListener("drop", ev => { ev.preventDefault(); $("drop").style.display = "none"; if (ev.dataTransfer.files[0]) readFile(ev.dataTransfer.files[0]); });
 
+// Start: an exported page shows its embedded run; otherwise ask the server for runs.
 (async () => {
   const embedded = JSON.parse($("trace-data").textContent);
   if (embedded) { load(embedded); return; }

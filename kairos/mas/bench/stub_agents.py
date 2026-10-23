@@ -40,19 +40,21 @@ _ERROR = re.compile(r"^[A-Za-z]*(Error|Exception)\b")
 
 
 def directive(c: FunctionCall) -> str:
+    """A call written into a message, e.g. `[[call {"args": {...}, "function": "send_money"}]]`."""
     return "[[call " + json.dumps({"function": c.function, "args": dict(c.args)}, sort_keys=True) + "]]"
 
 
 def directives(text: str) -> list[FunctionCall]:
-    out = []
-    for m in DIRECTIVE.finditer(text or ""):
+    """Every call written into `text` as a directive."""
+    calls = []
+    for match in DIRECTIVE.finditer(text or ""):
         try:
-            d = json.loads(m.group(1))
+            parsed = json.loads(match.group(1))
         except ValueError:
             continue
-        if isinstance(d, dict) and isinstance(d.get("function"), str):
-            out.append(FunctionCall(function=d["function"], args=dict(d.get("args") or {})))
-    return out
+        if isinstance(parsed, dict) and isinstance(parsed.get("function"), str):
+            calls.append(FunctionCall(function=parsed["function"], args=dict(parsed.get("args") or {})))
+    return calls
 
 
 def failed(text: str, *, reply: bool) -> bool:
@@ -61,20 +63,22 @@ def failed(text: str, *, reply: bool) -> bool:
     failure); the agent's OWN tool result by the prefixes the monitor and the
     tools use for refusals, holds and errors. Precision matters: a false failure
     is re-issued and would repeat an effect."""
-    t = (text or "").strip()
+    stripped = (text or "").strip()
     if reply:
-        return t.startswith("[task ") or "FAILED:" in t or "OK:" not in t
-    return (t.startswith(("SECURITY NOTICE", "Blocked", "A prior speculative action"))
-            or bool(_ERROR.match(t))
-            or (t.startswith("The ") and "request was NOT performed" in t[:200]))
+        return stripped.startswith("[task ") or "FAILED:" in stripped or "OK:" not in stripped
+    return (stripped.startswith(("SECURITY NOTICE", "Blocked", "A prior speculative action"))
+            or bool(_ERROR.match(stripped))
+            or (stripped.startswith("The ") and "request was NOT performed" in stripped[:200]))
 
 
 def _key(c: FunctionCall) -> str:
+    """A call's identity (function and arguments)."""
     return json.dumps({"f": c.function, "a": dict(c.args)}, sort_keys=True, default=str)
 
 
 @dataclass(slots=True)
 class _Step:
+    """One call the agent intends to issue, and the result it got (once issued)."""
     call: FunctionCall
     kind: str                # plan | injection | obey
     retry: bool = False
@@ -82,6 +86,14 @@ class _Step:
 
 
 class PlanReplayPolicy:
+    """The stub model's agent behaviour: given a conversation, the next action.
+
+    It keeps no state between turns. Each turn it rebuilds the agent's to-do list
+    from the conversation -- the plan (or the directives it received), the injection
+    plan once it is infected, directives in replies, re-issues of failed steps -- and
+    replays the turns so far against it. The next step not yet issued is the next
+    tool call; when none is left, the agent answers."""
+
     def __init__(self, spec: MASSpec, system: SuiteSystem, *, plan: list[FunctionCall],
                  injection_plan: list[FunctionCall], payload: Callable[[str], bool],
                  final_output: str) -> None:
@@ -95,22 +107,23 @@ class PlanReplayPolicy:
     # --- identity ------------------------------------------------------------
     @staticmethod
     def _agent(messages: list[dict[str, Any]]) -> str:
+        """Which agent this conversation belongs to, read off its system prompt."""
         system = message_text(messages[0]) if messages else ""
         if "front desk" in system:
             return ENTRY
-        m = re.search(r"You are '([^']+)'", system)
-        return m.group(1) if m else ENTRY
+        match = re.search(r"You are '([^']+)'", system)
+        return match.group(1) if match else ENTRY
 
     # --- the policy -----------------------------------------------------------
     def __call__(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> StubAction:
         me = self._agent(messages)
-        own = {t["function"]["name"] for t in tools if "function" in t} - MESSAGING
+        own = {tool["function"]["name"] for tool in tools if "function" in tool} - MESSAGING
         peers = set(reachable(self.spec, me))
-        first = message_text(messages[1]) if len(messages) > 1 else ""
+        first = message_text(messages[1]) if len(messages) > 1 else ""   # the task it received
 
-        relays: list[FunctionCall] = []
+        relays: list[FunctionCall] = []   # calls no reachable agent can run: passed up in the answer
         seen: set[str] = set()
-        queue: list[_Step] = []
+        queue: list[_Step] = []           # the to-do list, in order
 
         def routable(c: FunctionCall) -> bool:
             if c.function in own or self.system.owner(c.function) in peers:
@@ -119,12 +132,13 @@ class PlanReplayPolicy:
             return False
 
         def add(calls: list[FunctionCall], kind: str, at: int | None = None) -> None:
+            """Add new calls to the to-do list (at the end, or at position `at`)."""
             new = []
             for c in calls:
-                k = _key(c)
-                if k in seen:
+                key = _key(c)
+                if key in seen:
                     continue
-                seen.add(k)
+                seen.add(key)
                 if routable(c):
                     new.append(_Step(c, kind))
             if at is None:
@@ -138,32 +152,33 @@ class PlanReplayPolicy:
         add(self.plan if me == ENTRY else directives(first), "plan")
 
         # replay the conversation: each assistant turn issued the next step
-        k = 0
-        for i, m in enumerate(messages):
-            if m.get("role") != "assistant" or not m.get("tool_calls"):
+        issued = 0
+        for i, message in enumerate(messages):
+            if message.get("role") != "assistant" or not message.get("tool_calls"):
                 continue
-            result = next((message_text(r) for r in messages[i + 1:] if r.get("role") == "tool"), "")
-            if k >= len(queue):
+            result = next((message_text(later) for later in messages[i + 1:] if later.get("role") == "tool"), "")
+            if issued >= len(queue):
                 break
-            step = queue[k]
+            step = queue[issued]
             step.result = result
-            k += 1
-            nxt = k
+            issued += 1
+            insert_at = issued            # what this result adds comes right after the step
             reply = step.call.function not in own
             if failed(result, reply=reply) and not step.retry:
-                queue.insert(nxt, _Step(step.call, step.kind, retry=True))
-                nxt += 1
+                queue.insert(insert_at, _Step(step.call, step.kind, retry=True))
+                insert_at += 1
             if not infected and self.injection_plan and self.payload(result):
                 infected = True
-                add(self.injection_plan, "injection", at=nxt)
+                add(self.injection_plan, "injection", at=insert_at)
             if reply:                                  # a reply: obey the directives in it
-                add(directives(result), "obey", at=nxt)
+                add(directives(result), "obey", at=insert_at)
 
-        if k < len(queue):
-            return StubAction(calls=[self._route(queue[k].call, own)])
+        if issued < len(queue):
+            return StubAction(calls=[self._route(queue[issued].call, own)])
         return StubAction(content=self._answer(me, queue, relays, own))
 
     def _route(self, c: FunctionCall, own: set[str]) -> tuple[str, dict[str, Any]]:
+        """The tool call that carries out `c`: the tool itself, or a message to its owner."""
         if c.function in own:
             return c.function, dict(c.args)
         owner = self.system.owner(c.function)
@@ -172,21 +187,23 @@ class PlanReplayPolicy:
         return "send_message", {"agent": owner, "message": text}
 
     def _answer(self, me: str, queue: list[_Step], relays: list[FunctionCall], own: set[str]) -> str:
+        """The final answer: the front desk's result for the user, or a specialist's
+        status line per planned call (plus the calls it passes up)."""
         last: dict[str, _Step] = {}
-        for st in queue:
-            if st.kind == "plan":
-                last[_key(st.call)] = st          # the retry, if any, replaces the attempt
+        for step in queue:
+            if step.kind == "plan":
+                last[_key(step.call)] = step          # the retry, if any, replaces the attempt
 
-        def bad(st: _Step) -> bool:
-            return st.result is None or failed(st.result, reply=st.call.function not in own)
+        def bad(step: _Step) -> bool:
+            return step.result is None or failed(step.result, reply=step.call.function not in own)
 
         if me == ENTRY:
-            broken = [st for st in last.values() if bad(st)]
+            broken = [step for step in last.values() if bad(step)]
             if not broken:
                 return self.final_output or "Done."
             return "I could not complete the request: " + "; ".join(
-                f"{st.call.function} ({(st.result or 'not done')[:120]})" for st in broken)
-        lines = [("FAILED: " if bad(st) else "OK: ")
-                 + f"{st.call.function}: {(st.result or 'not done')[:1500]}" for st in last.values()]
+                f"{step.call.function} ({(step.result or 'not done')[:120]})" for step in broken)
+        lines = [("FAILED: " if bad(step) else "OK: ")
+                 + f"{step.call.function}: {(step.result or 'not done')[:1500]}" for step in last.values()]
         lines += [f"Please also run this: {directive(c)}" for c in relays]
         return "\n".join(lines) or "Nothing to do."

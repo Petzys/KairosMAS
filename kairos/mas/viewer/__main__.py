@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlparse
 from kairos.mas.viewer.legacy import load_trace
 
 STATIC = Path(__file__).parent / "static" / "index.html"
+# The page's slot for an embedded trace (an exported page carries its run in here).
 _PLACEHOLDER = '<script id="trace-data" type="application/json">null</script>'
 
 
@@ -33,12 +34,15 @@ def render_html(trace: dict[str, Any] | None) -> str:
     html = STATIC.read_text(encoding="utf-8")
     if trace is None:
         return html
+    # "</" inside the JSON would close the <script> element early (a trace holds
+    # arbitrary agent text); "<\/" means the same to JSON.
     data = json.dumps(trace, ensure_ascii=False).replace("</", "<\\/")
     assert html.count(_PLACEHOLDER) == 1
     return html.replace(_PLACEHOLDER, f'<script id="trace-data" type="application/json">{data}</script>')
 
 
 def export(result: str, out: str | None) -> Path:
+    """Write one run as a self-contained HTML page (next to the result by default)."""
     trace = load_trace(result)
     path = Path(out) if out else Path(result).with_suffix(".html")
     path.write_text(render_html(trace), encoding="utf-8")
@@ -54,40 +58,49 @@ class RunIndex:
         self._cache: dict[Path, tuple[float, dict[str, Any] | None]] = {}
 
     def runs(self) -> list[dict[str, Any]]:
-        out = []
-        for p in sorted(self.root.rglob("*.json")):
-            if p.name == "summary.json":
+        """One summary per result file (summary.json files and other JSON are skipped)."""
+        summaries = []
+        for path in sorted(self.root.rglob("*.json")):
+            if path.name == "summary.json":
                 continue
-            mtime = p.stat().st_mtime
-            hit = self._cache.get(p)
+            mtime = path.stat().st_mtime
+            hit = self._cache.get(path)
             if hit is None or hit[0] != mtime:
-                hit = (mtime, self._summarize(p))
-                self._cache[p] = hit
+                hit = (mtime, self._summarize(path))
+                self._cache[path] = hit
             if hit[1] is not None:
-                out.append(hit[1])
-        return out
+                summaries.append(hit[1])
+        return summaries
 
     def _summarize(self, p: Path) -> dict[str, Any] | None:
+        """What the run list shows of one result; None if the file is not a result."""
         try:
-            d = json.loads(p.read_text())
+            result = json.loads(p.read_text())
         except (OSError, ValueError):
             return None
-        if not isinstance(d, dict) or "user_task" not in d or not ("report" in d or "events" in d):
+        if not isinstance(result, dict) or "user_task" not in result or not ("report" in result or "events" in result):
             return None
-        rel = p.relative_to(self.root)
-        return {"path": str(rel), "group": str(rel.parent.parent) if len(rel.parts) > 2 else str(rel.parent),
-                "suite": d.get("suite"), "user_task": d.get("user_task"),
-                "injection_task": d.get("injection_task"), "utility": d.get("utility"),
-                "attack_success": d.get("attack_success"), "traced": bool(d.get("trace") or d.get("events"))}
+        relative = p.relative_to(self.root)
+        # results are stored as <config tag>/<suite>/<user task>/<file>: group by config and suite
+        group = str(relative.parent.parent) if len(relative.parts) > 2 else str(relative.parent)
+        return {"path": str(relative), "group": group,
+                "suite": result.get("suite"), "user_task": result.get("user_task"),
+                "injection_task": result.get("injection_task"), "utility": result.get("utility"),
+                "attack_success": result.get("attack_success"),
+                "traced": bool(result.get("trace") or result.get("events"))}
 
     def resolve(self, rel: str) -> Path:
-        p = (self.root / rel).resolve()
-        if self.root not in p.parents or p.suffix != ".json":
+        """The file a page asks for, which must be a JSON file under the log directory
+        (a request like `../../etc/passwd` is refused)."""
+        path = (self.root / rel).resolve()
+        if self.root not in path.parents or path.suffix != ".json":
             raise PermissionError(rel)
-        return p
+        return path
 
 
 def make_handler(index: RunIndex):
+    """The HTTP handler: `/` the page, `/api/runs` the run list, `/api/trace?path=...`
+    one run's trace."""
     page = render_html(None).encode()
 
     class Handler(BaseHTTPRequestHandler):
@@ -107,8 +120,8 @@ def make_handler(index: RunIndex):
                 elif url.path == "/api/runs":
                     self._send(HTTPStatus.OK, json.dumps(index.runs()).encode(), "application/json")
                 elif url.path == "/api/trace":
-                    rel = parse_qs(url.query).get("path", [""])[0]
-                    trace = load_trace(str(index.resolve(rel)))
+                    relative = parse_qs(url.query).get("path", [""])[0]
+                    trace = load_trace(str(index.resolve(relative)))
                     self._send(HTTPStatus.OK, json.dumps(trace, ensure_ascii=False).encode(), "application/json")
                 else:
                     self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
@@ -134,17 +147,17 @@ def serve(logdir: str, host: str, port: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="python -m kairos.mas.viewer", description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("serve", help="browse the results under a log directory")
-    s.add_argument("logdir", nargs="?", default="evaluation/logs")
-    s.add_argument("--host", default="127.0.0.1")
-    s.add_argument("--port", type=int, default=int(os.environ.get("KAIROS_VIEWER_PORT", 8765)))
-    e = sub.add_parser("export", help="write one run as a self-contained HTML file")
-    e.add_argument("result")
-    e.add_argument("-o", "--out", default=None)
-    args = p.parse_args(argv)
+    parser = argparse.ArgumentParser(prog="python -m kairos.mas.viewer", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="cmd", required=True)
+    serve_parser = commands.add_parser("serve", help="browse the results under a log directory")
+    serve_parser.add_argument("logdir", nargs="?", default="evaluation/logs")
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=int(os.environ.get("KAIROS_VIEWER_PORT", 8765)))
+    export_parser = commands.add_parser("export", help="write one run as a self-contained HTML file")
+    export_parser.add_argument("result")
+    export_parser.add_argument("-o", "--out", default=None)
+    args = parser.parse_args(argv)
     if args.cmd == "serve":
         if not Path(args.logdir).is_dir():
             print(f"ERROR: {args.logdir} is not a directory", file=sys.stderr)

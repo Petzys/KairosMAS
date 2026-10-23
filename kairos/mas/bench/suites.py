@@ -40,6 +40,7 @@ LAYOUTS = ("one", "domain", "singleton")
 
 @dataclass(frozen=True, slots=True)
 class Role:
+    """One agent of a suite's system: the tools it owns and where it belongs."""
     name: str
     tools: tuple[str, ...]
     description: str
@@ -49,15 +50,17 @@ class Role:
 
 @dataclass(frozen=True, slots=True)
 class SuiteSystem:
+    """A suite's tools partitioned into roles (the front desk owns none)."""
     suite: str
     roles: tuple[Role, ...]
     description: str = ""
 
     def role(self, name: str) -> Role:
-        return next(r for r in self.roles if r.name == name)
+        return next(role for role in self.roles if role.name == name)
 
     def owner(self, tool: str) -> str | None:
-        return next((r.name for r in self.roles if tool in r.tools), None)
+        """The agent that owns `tool` (None: no agent has it)."""
+        return next((role.name for role in self.roles if tool in role.tools), None)
 
     def tools_of(self, agent: str) -> tuple[str, ...]:
         return self.role(agent).tools
@@ -149,10 +152,12 @@ class BuildOptions:
 
 
 def suite_policy(suite: str, policy_dir: Path = POLICY_DIR) -> Policy:
+    """The suite's single-agent KAIROS policy, which the agents' labels are cut from."""
     return load_policy(policy_dir / f"{suite}.yaml")
 
 
 def _cluster_of(system: SuiteSystem, role: Role, layout: str) -> str:
+    """The cluster `role` belongs to under `layout`."""
     if layout == "one":
         return "system"
     if layout == "singleton":
@@ -167,58 +172,65 @@ def build_spec(suite: str, opts: BuildOptions | None = None) -> MASSpec:
     opts = opts or BuildOptions()
     system = SYSTEMS[suite]
     single = suite_policy(suite, opts.policy_dir)
-    ctx = single.context
-    clusters_of = {r.name: _cluster_of(system, r, opts.layout) for r in system.roles}
+    single_context = single.context
+    clusters_of = {role.name: _cluster_of(system, role, opts.layout) for role in system.roles}
 
+    # Agents: each gets the part of the single-agent labels that concerns its own tools.
     agents: dict[str, AgentSpec] = {}
-    for r in system.roles:
-        tools = set(r.tools)
+    for role in system.roles:
+        tools = set(role.tools)
         labels = AgentLabels(
-            revertable=[a for a in ctx.revertable if a in tools],
-            non_revertable=[a for a in ctx.non_revertable if a in tools],
-            taints=[t for t in single.resources.taints if t.source in tools],
-            trusted_sources=[t for t in single.resources.trusted_sources if t.source in tools],
+            revertable=[action for action in single_context.revertable if action in tools],
+            non_revertable=[action for action in single_context.non_revertable if action in tools],
+            taints=[taint for taint in single.resources.taints if taint.source in tools],
+            trusted_sources=[source for source in single.resources.trusted_sources if source.source in tools],
         )
-        cid = clusters_of[r.name]
-        agents[r.name] = AgentSpec(id=r.name, cluster=cid, endpoint=default_endpoint(r.name, cid),
-                                   description=r.description, labels=labels)
+        cluster_id = clusters_of[role.name]
+        agents[role.name] = AgentSpec(id=role.name, cluster=cluster_id,
+                                      endpoint=default_endpoint(role.name, cluster_id),
+                                      description=role.description, labels=labels)
 
     members: dict[str, list[Role]] = {}
-    for r in system.roles:
-        members.setdefault(clusters_of[r.name], []).append(r)
+    for role in system.roles:
+        members.setdefault(clusters_of[role.name], []).append(role)
     front = clusters_of[ENTRY]
 
+    # Clusters: the single-agent release settings, the rules about their members' tools,
+    # and a star-shaped contact book around the front desk's cluster.
     clusters: dict[str, ClusterSpec] = {}
-    for cid, roles in members.items():
-        actions = {t for r in roles for t in r.tools}
+    for cluster_id, roles in members.items():
+        actions = {tool for role in roles for tool in role.tools}
         rules = []
         for rule in single.rules:
             if not isinstance(rule, SimpleRule):
                 continue
-            acts = [rule.match.action] if isinstance(rule.match.action, str) else list(rule.match.action)
-            mine = [a for a in acts if a in actions]
-            if mine:
+            rule_actions = [rule.match.action] if isinstance(rule.match.action, str) else list(rule.match.action)
+            # A rule about several tools is kept, narrowed to the tools this cluster has.
+            actions_here = [action for action in rule_actions if action in actions]
+            if actions_here:
                 rules.append(SimpleRule(id=rule.id, decision=rule.decision, match=MatchBlock(
-                    action=mine if len(mine) > 1 else mine[0], params=rule.match.params,
-                    taint=rule.match.taint, origin=rule.match.origin)))
-        if cid == front:
-            peers = [PeerEntry(cluster=c) for c in members if c != front]
+                    action=actions_here if len(actions_here) > 1 else actions_here[0],
+                    params=rule.match.params, taint=rule.match.taint, origin=rule.match.origin)))
+        if cluster_id == front:
+            peers = [PeerEntry(cluster=other) for other in members if other != front]
         else:
-            peers = [PeerEntry(cluster=front)] if front != cid else []
+            peers = [PeerEntry(cluster=front)] if front != cluster_id else []
         if opts.message_review == "all" and peers:
             rules.append(SimpleRule(id="review-every-message", decision=Decision.REVIEW,
                                     match=MatchBlock(action=["a2a.send", "a2a.reply"])))
         elif opts.message_review != "policy":
             raise ValueError(f"message_review must be policy|all, got {opts.message_review!r}")
-        clusters[cid] = ClusterSpec(
-            id=cid, clearance=min(r.clearance for r in roles),
-            description=", ".join(r.name for r in roles),
+        clusters[cluster_id] = ClusterSpec(
+            # As a destination, a cluster is cleared for what its least-cleared member may hold.
+            id=cluster_id, clearance=min(role.clearance for role in roles),
+            description=", ".join(role.name for role in roles),
             policy=ClusterPolicy(
-                default_action=ctx.default_action, navigational_get=ctx.navigational_get,
-                embedded_identifiers=ctx.embedded_identifiers,
+                default_action=single_context.default_action, navigational_get=single_context.navigational_get,
+                embedded_identifiers=single_context.embedded_identifiers,
                 message_identifiers=opts.message_identifiers,
                 intra_cluster_checks=opts.intra_cluster_checks,
                 peers=PeerBook(on_miss=opts.peers_on_miss, entries=peers),
+                # Only a cluster with tools has external effects, hence a contact book.
                 external=single.resources.contact_book if actions else None,
                 rules=rules))
     spec = MASSpec(name=f"masdojo-{suite}-{opts.layout}", entry=ENTRY, agents=agents,
@@ -229,10 +241,10 @@ def build_spec(suite: str, opts: BuildOptions | None = None) -> MASSpec:
 
 def reachable(spec: MASSpec, sender: str) -> list[str]:
     """Agents `sender` may message: its cluster, plus what its contact book lists."""
-    out = []
+    agents = []
     for other in spec.agents:
         if other == sender:
             continue
         if spec.same_cluster(sender, other) or spec.peer_clearance(sender, other)[1]:
-            out.append(other)
-    return out
+            agents.append(other)
+    return agents

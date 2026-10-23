@@ -39,6 +39,7 @@ _PROMPT = 24000
 
 
 def clip(value: Any, n: int = _TEXT) -> Any:
+    """A string cut to `n` characters (saying how much was cut); anything else as is."""
     if isinstance(value, str):
         return value if len(value) <= n else value[:n] + f"… [{len(value) - n} more characters]"
     return value
@@ -53,9 +54,9 @@ def plain(value: Any, depth: int = 0) -> Any:
     if isinstance(value, str):
         return clip(value)
     if isinstance(value, dict):
-        return {str(k): plain(v, depth + 1) for k, v in list(value.items())[:200]}
+        return {str(key): plain(item, depth + 1) for key, item in list(value.items())[:200]}
     if isinstance(value, (list, tuple, set)):
-        return [plain(v, depth + 1) for v in list(value)[:200]]
+        return [plain(item, depth + 1) for item in list(value)[:200]]
     return clip(str(value))
 
 
@@ -68,17 +69,21 @@ class TraceRecorder:
         self._lock = threading.Lock()
 
     def emit(self, kind: str, **data: Any) -> None:
+        """Record one event: its kind, its fields (None fields left out), the time since
+        the recorder started (`t`) and its position in the run (`i`)."""
         try:
-            ev = {"kind": kind, **{k: plain(v) if k not in ("prompt", "system") else clip(v, _PROMPT)
-                                   for k, v in data.items() if v is not None}}
+            # Oracle prompts are kept longer than other texts.
+            event = {"kind": kind, **{key: plain(value) if key not in ("prompt", "system") else clip(value, _PROMPT)
+                                      for key, value in data.items() if value is not None}}
             with self._lock:
-                ev["t"] = round(time.monotonic() - self.t0, 4)
-                ev["i"] = len(self.events)
-                self.events.append(ev)
+                event["t"] = round(time.monotonic() - self.t0, 4)
+                event["i"] = len(self.events)
+                self.events.append(event)
         except Exception:                     # noqa: BLE001 - never fail the run
             pass
 
     def export(self, header: dict[str, Any]) -> dict[str, Any]:
+        """The trace as stored with a result: `header` (what was run) plus the events."""
         with self._lock:
             events = list(self.events)
         return {"version": TRACE_VERSION, "approximate": False, **header, "events": events}
@@ -87,30 +92,30 @@ class TraceRecorder:
 def topology(spec: Any, tools_of: Any = None) -> dict[str, Any]:
     """The system as the viewer draws it: clusters, their agents, the entry agent."""
     clusters = []
-    for cid, c in spec.clusters.items():
-        clearance = getattr(c, "clearance", None)
-        clusters.append({"id": cid, "clearance": getattr(clearance, "name", str(clearance)).lower()
+    for cluster_id, cluster in spec.clusters.items():
+        clearance = getattr(cluster, "clearance", None)
+        clusters.append({"id": cluster_id, "clearance": getattr(clearance, "name", str(clearance)).lower()
                          if clearance is not None else None,
-                         "agents": [a for a, ag in spec.agents.items() if ag.cluster == cid]})
-    agents = {a: {"cluster": ag.cluster, "description": ag.description, "endpoint": ag.endpoint,
-                  "tools": list(tools_of(a)) if tools_of else []}
-              for a, ag in spec.agents.items()}
-    out = {"entry": spec.entry, "clusters": clusters, "agents": agents}
+                         "agents": [name for name, agent in spec.agents.items() if agent.cluster == cluster_id]})
+    agents = {name: {"cluster": agent.cluster, "description": agent.description, "endpoint": agent.endpoint,
+                     "tools": list(tools_of(name)) if tools_of else []}
+              for name, agent in spec.agents.items()}
+    drawing = {"entry": spec.entry, "clusters": clusters, "agents": agents}
     try:                                       # the declared policies, as the spec file states them
         from kairos.mas.spec_parser import spec_to_dict
-        d = spec_to_dict(spec)
-        out["policy"] = {"system": d.get("system", {}), "clusters": d.get("clusters", {}),
-                         "agents": d.get("agents", {})}
+        declared = spec_to_dict(spec)
+        drawing["policy"] = {"system": declared.get("system", {}), "clusters": declared.get("clusters", {}),
+                             "agents": declared.get("agents", {})}
     except Exception:                         # noqa: BLE001 - the viewer works without it
         pass
-    return out
+    return drawing
 
 
 def emit(fabric: Any, kind: str, **data: Any) -> None:
     """Emit on the fabric's recorder, if it has one."""
-    rec = getattr(fabric, "recorder", None)
-    if rec is not None:
-        rec.emit(kind, **data)
+    recorder = getattr(fabric, "recorder", None)
+    if recorder is not None:
+        recorder.emit(kind, **data)
 
 
 class TracedJudge:
@@ -119,6 +124,9 @@ class TracedJudge:
 
     def __init__(self, inner: Any, recorder: TraceRecorder, agent: str, cluster: str) -> None:
         self._inner, self._rec, self._agent, self._cluster = inner, recorder, agent, cluster
+        # An LLM judge's chat client is wrapped once to record the model's prompt and
+        # answer. The client outlives runs (one client serves a whole benchmark), so
+        # the wrapper looks up the recorder on the client: the current run's.
         client = getattr(inner, "client", None)
         if client is not None:
             try:                              # a client outlives runs: the current run's recorder
@@ -131,26 +139,30 @@ class TracedJudge:
     @staticmethod
     def _wrap(client: Any) -> None:
         try:
-            orig = client.chat.completions.create
+            original_create = client.chat.completions.create
         except AttributeError:
             return
 
         def create(*args: Any, **kwargs: Any) -> Any:
-            resp = orig(*args, **kwargs)
+            response = original_create(*args, **kwargs)
+            # Only calls made while an oracle evaluates are recorded (the thread-local
+            # marker); the same client may serve the agents too.
             if not getattr(_ORACLE, "agent", None):     # the same client may serve the agents
-                return resp
-            msgs = kwargs.get("messages") or []
-            system = "\n\n".join(str(m.get("content")) for m in msgs if m.get("role") in ("system", "developer"))
-            prompt = "\n\n".join(str(m.get("content")) for m in msgs if m.get("role") not in ("system", "developer"))
+                return response
+            messages = kwargs.get("messages") or []
+            system = "\n\n".join(str(message.get("content")) for message in messages
+                                  if message.get("role") in ("system", "developer"))
+            prompt = "\n\n".join(str(message.get("content")) for message in messages
+                                  if message.get("role") not in ("system", "developer"))
             try:
-                raw = resp.choices[0].message.content
+                raw = response.choices[0].message.content
             except Exception:                 # noqa: BLE001
                 raw = None
-            rec = getattr(client, "_kairos_recorder", None)
-            if rec is not None:
-                rec.emit("oracle.llm", agent=_ORACLE.agent, model=kwargs.get("model"),
-                         system=system, prompt=prompt, raw=raw)
-            return resp
+            recorder = getattr(client, "_kairos_recorder", None)
+            if recorder is not None:
+                recorder.emit("oracle.llm", agent=_ORACLE.agent, model=kwargs.get("model"),
+                              system=system, prompt=prompt, raw=raw)
+            return response
 
         try:
             client.chat.completions.create = create
@@ -159,21 +171,24 @@ class TracedJudge:
             pass
 
     def evaluate(self, user_prompt: str, branch: Any) -> Any:
-        pending = [{"tool": getattr(h, "tool", "?"), "args": getattr(h, "args", {}),
-                    "reason": getattr(h, "reason", "")} for h in getattr(branch, "held_calls", [])]
+        """Record the request, evaluate with the real judge, record the verdict."""
+        pending = [{"tool": getattr(held, "tool", "?"), "args": getattr(held, "args", {}),
+                    "reason": getattr(held, "reason", "")} for held in getattr(branch, "held_calls", [])]
         self._rec.emit("oracle.request", agent=self._agent, cluster=self._cluster, pending=pending,
                        judge=type(self._inner).__name__)
         _ORACLE.agent = self._agent
         try:
-            v = self._inner.evaluate(user_prompt, branch)
+            verdict = self._inner.evaluate(user_prompt, branch)
         finally:
             _ORACLE.agent = None
         self._rec.emit("oracle.verdict", agent=self._agent, cluster=self._cluster,
-                       consistent=getattr(v, "consistent", None), per_action=getattr(v, "per_action", None),
-                       rationale=getattr(v, "rationale", None), flagged=getattr(v, "flagged", None))
-        return v
+                       consistent=getattr(verdict, "consistent", None),
+                       per_action=getattr(verdict, "per_action", None),
+                       rationale=getattr(verdict, "rationale", None), flagged=getattr(verdict, "flagged", None))
+        return verdict
 
     def __getattr__(self, name: str) -> Any:
+        # Everything else (llm_calls, client, ...) is the real judge's.
         return getattr(self._inner, name)
 
 

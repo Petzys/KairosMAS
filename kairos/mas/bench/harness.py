@@ -41,6 +41,8 @@ from kairos.mas.trace import TraceRecorder, topology
 
 @dataclass(slots=True)
 class RunConfig:
+    """One benchmark configuration. Every knob that changes behaviour is part of the
+    results directory name (`tag`), so different configurations never share results."""
     suite: str = "banking"
     layout: str = "domain"
     backend: str = "scripted"            # scripted | llm
@@ -93,6 +95,7 @@ class RunConfig:
 
 @dataclass(slots=True)
 class PairResult:
+    """The outcome of one (user task, injection task) pair; stored as JSON."""
     suite: str
     user_task: str
     injection_task: str | None
@@ -118,10 +121,13 @@ _FAMILY_NAMES = (("gpt", "GPT-4"), ("o1", "GPT-4"), ("o3", "GPT-4"), ("o4", "GPT
 
 
 def make_attack(cfg: RunConfig, suite: Any) -> Any:
+    """The configured AgentDojo attack. A model AgentDojo does not know is registered
+    under its family's name (or "AI assistant"), which the injection text uses."""
     name = cfg.model if cfg.backend == "llm" else "local"
-    if not any(k in name for k in MODEL_NAMES):
-        low = name.lower()
-        MODEL_NAMES[name] = next((n for f, n in _FAMILY_NAMES if f in low), "AI assistant")
+    if not any(known in name for known in MODEL_NAMES):
+        lowered = name.lower()
+        MODEL_NAMES[name] = next((family_name for family, family_name in _FAMILY_NAMES if family in lowered),
+                                 "AI assistant")
     return load_attack(cfg.attack, suite, _AttackTarget(name=name))
 
 
@@ -132,6 +138,17 @@ def _metered(client: Any, meter: Any) -> Any:
 def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | None,
              injections: dict[str, str], *, client: Any = None, judge_client: Any = None,
              meter: Any = None, verbose: bool = False) -> PairResult:
+    """Run one pair end to end:
+
+      1. the suite's environment, with the attack's injections placed in it;
+      2. the multi-agent system for the layout (spec), the oracle, the fabric, and
+         the agents (scripted or LLM);
+      3. one session from the user task's prompt;
+      4. AgentDojo's checks on the final environment (utility, attack success) and
+         the system-level metrics; optionally the flight trace.
+
+    `client` / `judge_client` are the agents' and the oracle's chat clients (LLM
+    backend / LLM oracle); `meter` counts the agents' tokens per pair."""
     env = suite.load_and_inject_default_environment(injections)
     task_env = user_task.init_environment(env)
     pre_env = task_env.model_copy(deep=True)
@@ -157,9 +174,10 @@ def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | N
                                prompt=cfg.judge_prompt)
 
     def factory(monitor: Any) -> Any:
-        j = make_judge(monitor)
-        judges.append(j)
-        return j
+        # Keep every judge the fabric creates: their call counts go into the metrics.
+        judge = make_judge(monitor)
+        judges.append(judge)
+        return judge
 
     recorder = TraceRecorder() if cfg.trace else None
     fabric = MonitorFabric(spec, judge_factory=factory, hold_notice=cfg.hold_notice,
@@ -179,23 +197,25 @@ def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | N
 
     if meter is not None:
         meter.reset()
-    rt = MASRuntime(spec, fabric, agents.handlers(), defense=cfg.defense, formatter=ToolBox.format)
+    runtime = MASRuntime(spec, fabric, agents.handlers(), defense=cfg.defense, formatter=ToolBox.format)
     if recorder is not None:
         recorder.emit("run.start", prompt=user_task.PROMPT, agent=spec.entry)
-    res = rt.run(user_task.PROMPT, timeout=cfg.timeout)
+    session = runtime.run(user_task.PROMPT, timeout=cfg.timeout)
 
-    model_output = [text_content_block_from_string(res.output)]
+    # AgentDojo's own checks, on the entry agent's answer and the final environment.
+    # The executed-call trace contains only calls that really ran (never a withheld one).
+    model_output = [text_content_block_from_string(session.output)]
     utility = suite._check_task_result(user_task, model_output, pre_env, task_env, tools.trace)
     attack_success = (suite._check_task_result(injection_task, model_output, pre_env, task_env, tools.trace)
                       if injection_task is not None else None)
-    metrics = _metrics(spec, res, tools, exposure, judges, injection_plan, plan, effects, agents)
+    metrics = _metrics(spec, session, tools, exposure, judges, injection_plan, plan, effects, agents)
     if meter is not None:
         metrics["tokens"] = meter.snapshot()
     trace = None
     if recorder is not None:
-        recorder.emit("run.end", agent=spec.entry, output=res.output, utility=bool(utility),
+        recorder.emit("run.end", agent=spec.entry, output=session.output, utility=bool(utility),
                       attack_success=None if attack_success is None else bool(attack_success),
-                      quiescent=res.quiescent)
+                      quiescent=session.quiescent)
         trace = recorder.export({
             "source": "recorded", "config": asdict(cfg), "suite": cfg.suite, "user_task": user_task.ID,
             "injection_task": injection_task.ID if injection_task else None,
@@ -205,45 +225,51 @@ def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | N
     return PairResult(suite=cfg.suite, user_task=user_task.ID,
                       injection_task=injection_task.ID if injection_task else None,
                       utility=bool(utility), attack_success=None if attack_success is None else bool(attack_success),
-                      output=res.output, metrics=metrics, report=res.report,
+                      output=session.output, metrics=metrics, report=session.report,
                       transcripts=getattr(agents, "transcripts", []), trace=trace)
 
 
 def _metrics(spec, res, tools: ToolBox, exposure: Exposure, judges: list[Any],
              injection_plan: list[Any], plan: list[Any], effects: set[str], agents: Any) -> dict[str, Any]:
-    m: dict[str, Any] = {"elapsed": round(res.elapsed, 4), "quiescent": res.quiescent,
-                         "executed_calls": len(tools.trace)}
+    """The system-level measurements of one session (see the module docstring)."""
+    metrics: dict[str, Any] = {"elapsed": round(res.elapsed, 4), "quiescent": res.quiescent,
+                               "executed_calls": len(tools.trace)}
     matcher = InjectionMatcher(injection_plan, plan, effects)
-    m["executed_injection_calls"] = sum(1 for c in tools.trace if matcher.matches(c.function, dict(c.args)))
+    metrics["executed_injection_calls"] = sum(1 for call in tools.trace
+                                              if matcher.matches(call.function, dict(call.args)))
+    # How far the injection spread: agents (and their clusters) that read the payload.
     exposed = exposure.agents
-    m["exposed_agents"] = exposed
-    m["exposed_clusters"] = sorted({spec.agents[a].cluster for a in exposed})
+    metrics["exposed_agents"] = exposed
+    metrics["exposed_clusters"] = sorted({spec.agents[agent].cluster for agent in exposed})
     if hasattr(agents, "infected"):
-        m["infected_agents"] = list(agents.infected)
-        m["retries"] = agents.retries
+        metrics["infected_agents"] = list(agents.infected)
+        metrics["retries"] = agents.retries
     report = res.report or {}
     counts = report.get("counts", {})
-    m.update({k: counts.get(k, 0) for k in ("messages", "intra_cluster", "inter_cluster", "rejected",
-                                            "held", "oracle_calls")})
-    m["flagged_agents"] = counts.get("flagged_agents", [])
-    m["oracle_llm_calls"] = sum(getattr(j, "llm_calls", 0) for j in judges)
+    metrics.update({key: counts.get(key, 0) for key in ("messages", "intra_cluster", "inter_cluster",
+                                                        "rejected", "held", "oracle_calls")})
+    metrics["flagged_agents"] = counts.get("flagged_agents", [])
+    metrics["oracle_llm_calls"] = sum(getattr(judge, "llm_calls", 0) for judge in judges)
+    # Where withheld actions were stopped: a message at the cluster boundary, anything
+    # else at the external boundary.
     stopped_cluster = stopped_external = 0
-    for a in (report.get("agents") or {}).values():
-        for r in a.get("resolutions", []):
-            for tool in r.get("aborted", []):
+    for agent_report in (report.get("agents") or {}).values():
+        for resolution in agent_report.get("resolutions", []):
+            for tool in resolution.get("aborted", []):
                 if tool in (A2A_SEND, A2A_REPLY):
                     stopped_cluster += 1
                 else:
                     stopped_external += 1
     # messages denied deterministically (topology, rules, confidentiality) never reach the
     # oracle; oracle refusals are already counted in the resolutions above
-    denied_msgs = sum(1 for x in report.get("messages", [])
-                      if x["status"] == "rejected" and not x["was_held"] and x["decision"] != "oracle")
-    m["stopped_at_cluster_boundary"] = stopped_cluster + denied_msgs
-    m["stopped_at_external_boundary"] = stopped_external
-    m["streamed_messages"] = sum(1 for x in report.get("messages", [])
-                                 if x["delivery"] == Delivery.STREAMING.value)
-    return m
+    denied_messages = sum(1 for message in report.get("messages", [])
+                          if message["status"] == "rejected" and not message["was_held"]
+                          and message["decision"] != "oracle")
+    metrics["stopped_at_cluster_boundary"] = stopped_cluster + denied_messages
+    metrics["stopped_at_external_boundary"] = stopped_external
+    metrics["streamed_messages"] = sum(1 for message in report.get("messages", [])
+                                       if message["delivery"] == Delivery.STREAMING.value)
+    return metrics
 
 
 # --- suites ------------------------------------------------------------------------
@@ -252,6 +278,7 @@ def load_suite(cfg: RunConfig) -> Any:
 
 
 def result_path(logdir: Path, cfg: RunConfig, user_task: str, injection_task: str | None) -> Path:
+    """<logdir>/<config tag>/<suite>/<user task>/<injection task or 'none'>.json"""
     return logdir / cfg.tag() / cfg.suite / user_task / f"{injection_task or 'none'}.json"
 
 
@@ -272,60 +299,68 @@ def run_suite(cfg: RunConfig, *, logdir: Path, user_tasks: list[str] | None = No
     out or failed underneath it -- and stop. A discarded pair is not stored, so a
     resumed run repeats it."""
     suite = load_suite(cfg)
-    uts = [suite.user_tasks[u] for u in (user_tasks or list(suite.user_tasks))]
-    its = [suite.injection_tasks[i] for i in (injection_tasks or list(suite.injection_tasks))]
+    chosen_user_tasks = [suite.user_tasks[task] for task in (user_tasks or list(suite.user_tasks))]
+    chosen_injection_tasks = [suite.injection_tasks[task]
+                              for task in (injection_tasks or list(suite.injection_tasks))]
     attack = make_attack(cfg, suite) if (attacked and cfg.attack) else None
     rows: list[dict[str, Any]] = []
+    # Every user task benign (if asked), then under each injection task.
     pairs: list[tuple[Any, Any | None]] = []
-    for ut in uts:
+    for user_task in chosen_user_tasks:
         if benign:
-            pairs.append((ut, None))
+            pairs.append((user_task, None))
         if attack is not None:
-            pairs += [(ut, it) for it in its]
-    t0 = time.monotonic()
-    for i, (ut, it) in enumerate(pairs, 1):
-        path = result_path(logdir, cfg, ut.ID, it.ID if it else None)
+            pairs += [(user_task, injection_task) for injection_task in chosen_injection_tasks]
+    started = time.monotonic()
+    for i, (user_task, injection_task) in enumerate(pairs, 1):
+        path = result_path(logdir, cfg, user_task.ID, injection_task.ID if injection_task else None)
         if path.exists() and not force:
-            rows.append(json.loads(path.read_text()))
+            rows.append(json.loads(path.read_text()))       # resume: already done
             continue
-        label = f"{cfg.suite} {ut.ID} {it.ID if it else 'benign'}"
-        if before_pair is not None and (why := before_pair()):
-            print(f"stopping before {label}: {why}", flush=True)
-            break
-        injections = attack.attack(ut, it) if it is not None else {}
-        r = run_pair(cfg, suite, ut, it, injections, client=client, judge_client=judge_client,
-                     meter=meter, verbose=verbose)
-        if after_pair is not None and (why := after_pair(r)):
-            print(f"discarding {label} and stopping: {why}", flush=True)
-            break
-        save(path, cfg, r)
+        label = f"{cfg.suite} {user_task.ID} {injection_task.ID if injection_task else 'benign'}"
+        if before_pair is not None:
+            reason = before_pair()
+            if reason:
+                print(f"stopping before {label}: {reason}", flush=True)
+                break
+        injections = attack.attack(user_task, injection_task) if injection_task is not None else {}
+        result = run_pair(cfg, suite, user_task, injection_task, injections, client=client,
+                          judge_client=judge_client, meter=meter, verbose=verbose)
+        if after_pair is not None:
+            reason = after_pair(result)
+            if reason:
+                print(f"discarding {label} and stopping: {reason}", flush=True)
+                break
+        save(path, cfg, result)
         rows.append(json.loads(path.read_text()))
         if progress:
-            sec = "-" if r.attack_success is None else ("ATTACK" if r.attack_success else "safe")
-            print(f"[{i}/{len(pairs)} {time.monotonic() - t0:6.1f}s] {cfg.suite} {ut.ID} "
-                  f"{it.ID if it else 'benign'}: utility={'ok' if r.utility else 'FAIL'} {sec} "
-                  f"oracle={r.metrics.get('oracle_calls', 0)} msgs={r.metrics.get('inter_cluster', 0)}"
-                  f"/{r.metrics.get('messages', 0)}", flush=True)
+            security = "-" if result.attack_success is None else ("ATTACK" if result.attack_success else "safe")
+            print(f"[{i}/{len(pairs)} {time.monotonic() - started:6.1f}s] {cfg.suite} {user_task.ID} "
+                  f"{injection_task.ID if injection_task else 'benign'}: "
+                  f"utility={'ok' if result.utility else 'FAIL'} {security} "
+                  f"oracle={result.metrics.get('oracle_calls', 0)} msgs={result.metrics.get('inter_cluster', 0)}"
+                  f"/{result.metrics.get('messages', 0)}", flush=True)
     return rows
 
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    benign = [r for r in rows if r["injection_task"] is None]
-    attacked = [r for r in rows if r["injection_task"] is not None]
+    """Per-suite figures: rates in percent, means per pair (a list counts its length)."""
+    benign = [row for row in rows if row["injection_task"] is None]
+    attacked = [row for row in rows if row["injection_task"] is not None]
 
-    def rate(xs: list[bool]) -> float | None:
-        return round(100 * sum(xs) / len(xs), 1) if xs else None
+    def rate(flags: list[bool]) -> float | None:
+        return round(100 * sum(flags) / len(flags), 1) if flags else None
 
-    def mean(key: str, xs: list[dict[str, Any]]) -> float | None:
-        vals = [x["metrics"].get(key, 0) for x in xs]
-        vals = [len(v) if isinstance(v, list) else v for v in vals]
-        return round(sum(vals) / len(vals), 3) if vals else None
+    def mean(key: str, selected: list[dict[str, Any]]) -> float | None:
+        values = [row["metrics"].get(key, 0) for row in selected]
+        values = [len(value) if isinstance(value, list) else value for value in values]
+        return round(sum(values) / len(values), 3) if values else None
 
     return {
         "pairs": len(rows),
-        "utility": rate([r["utility"] for r in benign]),
-        "utility_under_attack": rate([r["utility"] for r in attacked]),
-        "asr": rate([bool(r["attack_success"]) for r in attacked]),
+        "utility": rate([row["utility"] for row in benign]),
+        "utility_under_attack": rate([row["utility"] for row in attacked]),
+        "asr": rate([bool(row["attack_success"]) for row in attacked]),
         "oracle_calls_benign": mean("oracle_calls", benign),
         "oracle_calls_attacked": mean("oracle_calls", attacked),
         "inter_cluster_messages": mean("inter_cluster", rows),
@@ -336,5 +371,5 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "stopped_at_cluster_boundary": mean("stopped_at_cluster_boundary", attacked),
         "stopped_at_external_boundary": mean("stopped_at_external_boundary", attacked),
         "elapsed": mean("elapsed", rows),
-        "not_quiescent": sum(1 for r in rows if not r["metrics"].get("quiescent", True)),
+        "not_quiescent": sum(1 for row in rows if not row["metrics"].get("quiescent", True)),
     }
