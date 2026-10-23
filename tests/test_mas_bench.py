@@ -175,6 +175,24 @@ def test_llm_backend_with_lineage_oracle() -> None:
     assert r.metrics["oracle_llm_calls"] == len(model.oracle_prompts)
 
 
+def test_an_agent_called_as_a_tool_is_pointed_to_send_message() -> None:
+    model = FakeModel({
+        "assistant": [{"calls": [("accounts", {"message": "List my 100 most recent transactions."})]},
+                      {"calls": [("send_message", {"agent": "accounts",
+                                                   "message": "List my 100 most recent transactions."})]},
+                      {"content": "Your total spending in March 2022 was £1,050."}],
+        "accounts": [{"calls": [("get_most_recent_transactions", {"n": 100})]},
+                     {"content": "Transactions: see above, March total 1050."}],
+    })
+    cfg = RunConfig(suite="banking", backend="llm", oracle="llm", model="fake-model")
+    suite = get_suite("v1", "banking")
+    r = run_pair(cfg, suite, suite.user_tasks["user_task_1"], None, {}, client=model, judge_client=model)
+    front = next(t for t in r.transcripts if t["agent"] == "assistant")
+    errors = [m.get("error") for m in front["messages"] if m["role"] == "tool"]
+    assert "'accounts' is an agent, not a tool" in errors[0] and "send_message(agent='accounts'" in errors[0]
+    assert r.utility and r.metrics["oracle_llm_calls"] == 0          # nothing reached the monitor
+
+
 def test_placeholders_inside_strings_are_wildcards() -> None:
     inj = [FunctionCall(function="send_email",
                         args={"recipients": ["janeLong@google.com"], "subject": "Travel Information at X"},
