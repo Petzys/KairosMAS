@@ -33,6 +33,7 @@ from kairos.mas.bench.environment import Exposure, ToolBox
 from kairos.mas.bench.suites import ENTRY, SuiteSystem, reachable
 from kairos.mas.runtime import AgentHost
 from kairos.mas.spec import MASSpec
+from kairos.mas.trace import emit
 
 
 def send_message(agent: str, message: str) -> str:
@@ -132,16 +133,22 @@ class LLMAgents:
         for _ in range(self.max_iters):
             _, _, _, messages, _ = llm.query(incoming, runtime, EmptyEnv(), messages, {})
             calls = messages[-1].get("tool_calls") or []
+            emit(host.fabric, "agent.llm", agent=agent, task=task_id,
+                 text=get_text_content_as_str(messages[-1].get("content") or []),
+                 tool_calls=[{"function": c.function, "args": dict(c.args)} for c in calls])
             if not calls:
                 host.ep.terminal()
                 notes = host.ep.drain_notices()
                 if notes and reentries > 0:          # correct the record once (KAIROS A1)
                     reentries -= 1
+                    self._notices_in(host, notes)
                     messages = [*messages, *(_user(n) for n in notes)]
                     continue
                 break
             messages = [*messages, *(self._call(host, tc) for tc in calls)]
-            messages = [*messages, *(_user(n) for n in host.ep.drain_notices())]
+            notes = host.ep.drain_notices()
+            self._notices_in(host, notes)
+            messages = [*messages, *(_user(n) for n in notes)]
         else:
             host.ep.terminal()
         last = messages[-1]
@@ -150,6 +157,11 @@ class LLMAgents:
         if self.verbose:
             print(f"[{agent}] {text[:160]!r}")
         return AgentResult(text=text)
+
+    @staticmethod
+    def _notices_in(host: AgentHost, notes: list[str]) -> None:
+        for n in notes:
+            emit(host.fabric, "agent.notice", agent=host.agent_id, text=n)
 
     def _call(self, host: AgentHost, tc: FunctionCall) -> ChatToolResultMessage:
         me = host.agent_id

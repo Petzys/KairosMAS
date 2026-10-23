@@ -42,6 +42,7 @@ from kairos.mas.a2a.protocol import (
 )
 from kairos.mas.agent import AgentMonitor, MessageRecord, MsgStatus, Outcome
 from kairos.mas.fabric import MonitorFabric
+from kairos.mas.trace import emit
 from kairos.mas.transport import KMID_HEADER, EventStream, Headers, Network
 from kairos.speculative.effects import EffectKind
 
@@ -147,6 +148,16 @@ class EnforcementPoint:
         """One tool call of the agent. Mirrors adapters/agentdojo/hooks.PolicyEnforcer
         for a single call; abort notices are queued on the monitor and handed to
         the agent by its harness (drain_notices)."""
+        call_id = str(getattr(tc, "id", "") or "")
+        emit(self.fabric, "tool.call", agent=self.agent_id, tool=tc.function, args=dict(tc.args),
+             call_id=call_id)
+        out = self._call_tool(tc, execute)
+        status = "executed" if out.executed else "held" if out.held else "blocked" if out.error else "answered"
+        emit(self.fabric, "tool.result", agent=self.agent_id, tool=tc.function, call_id=call_id,
+             status=status, text=out.text, error=out.error)
+        return out
+
+    def _call_tool(self, tc: Any, execute: ToolExecutor) -> ToolOutcome:
         if not self.defense:
             res, err = execute(tc.function, dict(tc.args))
             return ToolOutcome(self.formatter(res), err, executed=True)
@@ -831,6 +842,11 @@ class EnforcementPoint:
         rec = self.fabric.new_message(self.agent_id, dest, msg.text, msg.data, reply=reply, delivery=delivery)
         rec.intra = self.spec.same_cluster(self.agent_id, dest)
         rec.status, rec.decision = MsgStatus.DELIVERED, "nodefense"
+        ends = {"kmid": rec.kmid, "from": self.agent_id, "to": dest}
+        emit(self.fabric, "msg.send", **ends, text=rec.content, reply=reply, delivery=delivery.value,
+             intra=rec.intra)
+        emit(self.fabric, "msg.outcome", **ends, outcome="released", by="nodefense", intra=rec.intra)
+        emit(self.fabric, "msg.deliver", **ends, reply=reply)
 
     def _gate_reply(self, body: bytes, requester: str | None,
                     in_reply_to: str | None) -> tuple[bytes, Headers]:

@@ -42,6 +42,8 @@ benign work keeps running in parallel and only what has to be decided is decided
 | [`a2a/`](a2a) | A2A v1.0 wire types, protocol adapter, minimal server/client, HTTP sidecars |
 | [`transport.py`](transport.py), [`runtime.py`](runtime.py) | Network abstraction, in-process hosts and session driver |
 | [`serve.py`](serve.py) | Deployment entry point in front of real A2A agents |
+| [`trace.py`](trace.py) | Flight recorder: every boundary crossing, decision and reasoning step of a run, in order |
+| [`viewer/`](viewer) | Graphical replay of runs (`python -m kairos.mas.viewer`) |
 | [`bench/`](bench) | **MASDojo**, the system-level benchmark (below) |
 
 The single-agent core changed in one place: tokens record their owner and the
@@ -380,6 +382,38 @@ The command is the example above.
   pilot and failed in the run).
 * Six attacked tasks per condition: an illustration of the mechanisms with a real
   model and a real oracle, not a measurement of ASR.
+
+## Run viewer
+
+A graphical replay of a run for debugging and explanation: the principal, the clusters
+with their decision points (DP), the agents with their enforcement points (EP), the
+oracle, and the external world behind the external boundary. Events animate between
+them in order — the principal's prompt, each model turn (its text and tool calls),
+tool calls through the EP (executed / held / blocked), messages leaving and entering
+clusters (released / held / rejected, delivered), each gate decision with its layer
+and reason, each oracle consultation (pending actions, the model's full prompt and raw
+answer, the verdict) and each resolution (committed / withheld), and the notices the
+agents receive. Play, pause, step back and forth, reset, jump, scrub; 0.25× to 16×,
+in uniform steps or with the recorded timing. A side panel lists the events
+(filterable by category) and shows the selected one in full, with the injected text and
+the attacker's values highlighted.
+
+```bash
+# browse every result under a log directory (http://127.0.0.1:8765)
+.venv/bin/python -m kairos.mas.viewer serve evaluation/logs
+# one self-contained HTML file for one run (open anywhere, share)
+.venv/bin/python -m kairos.mas.viewer export evaluation/logs/<tag>/banking/user_task_2/injection_task_7.json -o run.html
+```
+
+Every MASDojo result now stores a flight trace ([`trace.py`](trace.py); about 35 KB per
+task; `--no-trace` turns it off), recorded from hooks in the enforcement points, the
+monitors, the oracle and the agents' harness, with one clock across all hosts.
+Recording changes no outcome (the scripted grid reproduces its numbers exactly). A
+result stored without a trace — every run before the recorder, or with `--no-trace` — is
+reconstructed from its report and transcripts and marked *approximate*: within an agent
+the order is exact; across agents it is rebuilt by following each message into the
+receiving agent's transcript (LLM runs) or from the monitor's message numbering
+(scripted runs, whose message texts were not stored).
 
 ## Tests
 

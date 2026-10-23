@@ -20,6 +20,7 @@ from kairos.mas.a2a.server import A2AServer, AgentResult
 from kairos.mas.enforcement import EnforcementPoint
 from kairos.mas.fabric import MonitorFabric
 from kairos.mas.spec import MASSpec
+from kairos.mas.trace import emit
 from kairos.mas.transport import InProcessNetwork
 
 TaskHandler = Callable[["AgentHost", Message, str], AgentResult]
@@ -53,9 +54,15 @@ class AgentHost:
         with self._cv:
             self.active += 1
             self.tasks_run += 1
+        emit(self.fabric, "agent.task", agent=self.agent_id, task=task_id, text=msg.content_text())
+        result: AgentResult | None = None
         try:
-            return self.handler(self, msg, task_id)
+            result = self.handler(self, msg, task_id)
+            return result
         finally:
+            emit(self.fabric, "agent.done", agent=self.agent_id, task=task_id,
+                 text=result.text if result is not None else None,
+                 state=result.state.short if result is not None else "crashed")
             with self._cv:
                 self.active -= 1
                 self._cv.notify_all()

@@ -105,6 +105,9 @@ def parse_args() -> argparse.Namespace:
                         "once it is spent")
     p.add_argument("--dump-spec", default=None, metavar="DIR",
                    help="write the generated system specs (YAML) for the chosen suites and layouts, then exit")
+    p.add_argument("--no-trace", action="store_true",
+                   help="do not store a flight trace with each result (the viewer then reconstructs "
+                        "an approximate one: python -m kairos.mas.viewer)")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
@@ -245,7 +248,7 @@ def main() -> int:
                     message_identifiers=args.message_identifiers, message_review=args.message_review,
                     model=args.model, judge_model=args.judge_model, judge_prompt=args.judge_prompt,
                     tool_latency=args.tool_latency, timeout=args.timeout,
-                    benchmark_version=args.benchmark_version)
+                    benchmark_version=args.benchmark_version, trace=not args.no_trace)
                 print(f"== {cfg.tag()} / {s}", flush=True)
                 rows = run_suite(cfg, logdir=logdir, user_tasks=args.user_tasks,
                                  injection_tasks=args.injection_tasks, benign=not args.attack_only,

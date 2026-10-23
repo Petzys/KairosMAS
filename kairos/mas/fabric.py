@@ -26,6 +26,7 @@ from kairos.mas.a2a.adapter import Delivery
 from kairos.mas.agent import AgentMonitor, MessageRecord, MsgStatus
 from kairos.mas.causal import CausalEvent, CausalLog, EventId, EventKind, VectorClock
 from kairos.mas.spec import ClusterSpec, MASSpec
+from kairos.mas.trace import TracedJudge, TraceRecorder, emit
 
 JudgeFactory = Callable[[AgentMonitor], Any]
 
@@ -56,8 +57,10 @@ class MonitorFabric:
         max_stall_seconds: float = 120.0,
         sync_get: bool = True,
         downstream_notices: bool = True,
+        recorder: TraceRecorder | None = None,
     ) -> None:
         self.spec = spec
+        self.recorder = recorder          # the run's flight recorder (kairos.mas.trace), if any
         self.judge_factory = judge_factory or (lambda _m: DeterministicJudge())
         self.commit_gate_factory = commit_gate_factory or AutoCommitGate
         self.monitor_kwargs = dict(mode=mode, hold_notice=hold_notice,
@@ -82,6 +85,8 @@ class MonitorFabric:
                 mon = AgentMonitor(self.spec, aid, fabric=self, log=dp.log,
                                    commit_gate=self.commit_gate_factory(), **self.monitor_kwargs)
                 mon.judge = self.judge_factory(mon)
+                if self.recorder is not None and mon.judge is not None:
+                    mon.judge = TracedJudge(mon.judge, self.recorder, aid, dp.cluster.id)
                 dp.agents[aid] = mon
 
     # --- lifecycle ------------------------------------------------------------
@@ -164,6 +169,8 @@ class MonitorFabric:
     def deliver(self, record: MessageRecord) -> CausalEvent:
         """Record a released message at its receiver (RECV, label join)."""
         ev = self.agent(record.receiver).on_receive(record)
+        emit(self, "msg.deliver", kmid=record.kmid, **{"from": record.sender}, to=record.receiver,
+             reply=record.reply)
         for dp in self.dps.values():
             dp.log.retry()
         return ev

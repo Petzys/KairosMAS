@@ -47,6 +47,7 @@ from kairos.mas.policy import (
     annotate_intra_cluster, build_engines, evaluate_message, message_event,
 )
 from kairos.mas.spec import A2A_EXTERNAL, A2A_REPLY, A2A_SEND, MASSpec
+from kairos.mas.trace import emit
 from kairos.monitor import ReferenceMonitor, SessionResult
 from kairos.speculative.branch import Branch, HeldAction
 from kairos.speculative.effects import EffectKind, State
@@ -196,6 +197,9 @@ class AgentMonitor(ReferenceMonitor):
     def gate(self, event: Event) -> StageResult:
         with self.lock:
             result = super().gate(event)
+            emit(self.fabric, "gate", agent=self.agent_id, cluster=self.cluster_id,
+                 target=event.metadata.get("function") or event.object, decision=result.decision.value,
+                 by=result.produced_by, reason=result.reason, channel=getattr(event.channel, "value", None))
             self.record_event(EventKind.TOOL_CALL, {
                 "tool": event.metadata.get("function") or event.object,
                 "args": dict(event.content) if isinstance(event.content, dict) else {},
@@ -246,6 +250,11 @@ class AgentMonitor(ReferenceMonitor):
 
     def _after_resolution(self, trigger: str, cdec: Any, branch: Branch, outcome: ResolveOutcome) -> None:
         self.oracle_calls += 1
+        emit(self.fabric, "resolution", agent=self.agent_id, cluster=self.cluster_id, trigger=trigger,
+             committed=[self._action_summary(h) for h in outcome.committed],
+             aborted=[self._action_summary(h) for h in outcome.aborted],
+             rationale=cdec.verdict.rationale, decided_by=cdec.source,
+             errors=[[h.tool, str(e)] for h, _r, e in outcome.dispatched if e])
         for held, res, err in outcome.dispatched:
             cid = getattr(held.call_ref, "id", None)
             if cid is not None and not isinstance(held.call_ref, MessageRecord):
@@ -339,6 +348,7 @@ class AgentMonitor(ReferenceMonitor):
             return None
 
     def notify(self, text: str) -> None:
+        emit(self.fabric, "notice", agent=self.agent_id, text=text)
         with self._notice_lock:
             self._notices.append(text)
 
@@ -358,7 +368,13 @@ class AgentMonitor(ReferenceMonitor):
             self._await_lineage()
             spec = self.spec
             record.intra = spec.same_cluster(record.sender, record.receiver)
+            emit(self.fabric, "msg.send", kmid=record.kmid, **{"from": record.sender}, to=record.receiver,
+                 text=record.content, reply=record.reply, delivery=record.delivery.value,
+                 intra=record.intra, in_reply_to=record.in_reply_to)
             stage = self._evaluate(record)
+            emit(self.fabric, "gate", agent=self.agent_id, cluster=self.cluster_id, kmid=record.kmid,
+                 target=f"message to {record.receiver}", decision=stage.decision.value,
+                 by=stage.produced_by, reason=stage.reason, channel="a2a")
             if record.intra and spec.cluster_of(self.agent_id).policy.intra_cluster_checks == "annotate":
                 record.annotations = annotate_intra_cluster(
                     spec, self.engines, record.sender, record.receiver, record.text, record.data,
@@ -446,6 +462,7 @@ class AgentMonitor(ReferenceMonitor):
                     record.status = MsgStatus.RELEASED
                     record.decision = "duplicate"
                     self.fabric.track(record)
+                    self._emit_outcome(record, "duplicate", of=dup.kmid)
                     return MessageDecision(Outcome.RELEASE, record, duplicate_of=dup)
             stage = self._evaluate(record)
             if stage.decision is Decision.DENY:
@@ -463,6 +480,7 @@ class AgentMonitor(ReferenceMonitor):
             record.status = MsgStatus.HELD
             record.was_held = True
             self.fabric.track(record)
+            self._emit_outcome(record, "held")
             return MessageDecision(Outcome.HOLD, record)
         return self._rejected(record, notices.message_rejected(record.receiver, eff.reason))
 
@@ -485,28 +503,37 @@ class AgentMonitor(ReferenceMonitor):
                          reason=stage.reason or stage.produced_by)
         return view, tuple(embedded)
 
+    def _emit_outcome(self, record: MessageRecord, outcome: str, **extra: Any) -> None:
+        emit(self.fabric, "msg.outcome", kmid=record.kmid, **{"from": record.sender}, to=record.receiver,
+             outcome=outcome, by=record.decision, reason=record.reason, intra=record.intra, **extra)
+
     def _released(self, record: MessageRecord) -> MessageDecision:
         record.status = MsgStatus.RELEASED
         record.released_at = time.monotonic()
         self.fabric.track(record)
         self._trace_sent(record, "delivered")
+        self._emit_outcome(record, "released")
         return MessageDecision(Outcome.RELEASE, record)
 
     def _rejected(self, record: MessageRecord, notice: str) -> MessageDecision:
         record.status = MsgStatus.REJECTED
         self.fabric.track(record)
+        self._emit_outcome(record, "rejected", notice=notice)
         return MessageDecision(Outcome.REJECT, record, notice)
 
     def _release_held(self, record: MessageRecord) -> None:
         record.status = MsgStatus.RELEASED
         record.released_at = time.monotonic()
         self._trace_sent(record, "delivered")
+        emit(self.fabric, "msg.release", kmid=record.kmid, **{"from": record.sender}, to=record.receiver)
         if record.on_release is not None:
             record.on_release(record)
 
     def _drop_held(self, record: MessageRecord, reason: str) -> None:
         record.status = MsgStatus.REJECTED
         record.reason = reason
+        emit(self.fabric, "msg.drop", kmid=record.kmid, **{"from": record.sender}, to=record.receiver,
+             reason=reason)
         if record.on_drop is not None:
             record.on_drop(record, notices.message_rejected(record.receiver, reason))
 
@@ -548,6 +575,7 @@ class AgentMonitor(ReferenceMonitor):
         reached this agent: untrusted content, recorded like a received message (it
         carries no labels and no causal past the monitor knows)."""
         with self.lock:
+            emit(self.fabric, "inbound.external", agent=self.agent_id, source=source, text=text)
             self.store.record_text(text, source)
             ev = self.record_event(EventKind.RECV, {"from": source, "reply": False, "intra": False,
                                                     "text": _clip(text, 1500)})

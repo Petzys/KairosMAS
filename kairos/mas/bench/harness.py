@@ -36,6 +36,7 @@ from kairos.mas.fabric import MonitorFabric
 from kairos.mas.runtime import MASRuntime
 from kairos.mas.spec import A2A_REPLY, A2A_SEND
 from kairos.mas.stub_llm import StubChatClient, is_stub
+from kairos.mas.trace import TraceRecorder, topology
 
 
 @dataclass(slots=True)
@@ -58,6 +59,7 @@ class RunConfig:
     timeout: float = 300.0
     benchmark_version: str = "v1"
     max_iters: int = 15
+    trace: bool = True                   # record a flight trace (kairos.mas.trace) with each result
 
     def tag(self) -> str:
         """Results directory name: every knob that changes behaviour, plus a hash of
@@ -100,6 +102,7 @@ class PairResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     report: dict[str, Any] = field(default_factory=dict)
     transcripts: list[dict[str, Any]] = field(default_factory=list)
+    trace: dict[str, Any] | None = None   # the run's flight trace, for `python -m kairos.mas.viewer`
 
 
 class _AttackTarget(SimpleNamespace):
@@ -158,8 +161,9 @@ def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | N
         judges.append(j)
         return j
 
+    recorder = TraceRecorder() if cfg.trace else None
     fabric = MonitorFabric(spec, judge_factory=factory, hold_notice=cfg.hold_notice,
-                           max_held_per_branch=cfg.max_held_per_branch)
+                           max_held_per_branch=cfg.max_held_per_branch, recorder=recorder)
     tools = ToolBox(suite, task_env, system, latency=cfg.tool_latency)
 
     if cfg.backend == "scripted":
@@ -176,6 +180,8 @@ def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | N
     if meter is not None:
         meter.reset()
     rt = MASRuntime(spec, fabric, agents.handlers(), defense=cfg.defense, formatter=ToolBox.format)
+    if recorder is not None:
+        recorder.emit("run.start", prompt=user_task.PROMPT, agent=spec.entry)
     res = rt.run(user_task.PROMPT, timeout=cfg.timeout)
 
     model_output = [text_content_block_from_string(res.output)]
@@ -185,11 +191,22 @@ def run_pair(cfg: RunConfig, suite: Any, user_task: Any, injection_task: Any | N
     metrics = _metrics(spec, res, tools, exposure, judges, injection_plan, plan, effects, agents)
     if meter is not None:
         metrics["tokens"] = meter.snapshot()
+    trace = None
+    if recorder is not None:
+        recorder.emit("run.end", agent=spec.entry, output=res.output, utility=bool(utility),
+                      attack_success=None if attack_success is None else bool(attack_success),
+                      quiescent=res.quiescent)
+        trace = recorder.export({
+            "source": "recorded", "config": asdict(cfg), "suite": cfg.suite, "user_task": user_task.ID,
+            "injection_task": injection_task.ID if injection_task else None,
+            "prompt": user_task.PROMPT, "injection_goal": injection_task.GOAL if injection_task else None,
+            "injections": injections, "defense": cfg.defense,
+            "topology": topology(spec, system.tools_of)})
     return PairResult(suite=cfg.suite, user_task=user_task.ID,
                       injection_task=injection_task.ID if injection_task else None,
                       utility=bool(utility), attack_success=None if attack_success is None else bool(attack_success),
                       output=res.output, metrics=metrics, report=res.report,
-                      transcripts=getattr(agents, "transcripts", []))
+                      transcripts=getattr(agents, "transcripts", []), trace=trace)
 
 
 def _metrics(spec, res, tools: ToolBox, exposure: Exposure, judges: list[Any],

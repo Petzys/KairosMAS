@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KAIROS MAS Run Viewer</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #677085; --line: #d9dde5;
+  --cluster: #eef2f8; --cluster-line: #b9c3d6; --agent: #ffffff;
+  --blue: #2f6fdf; --purple: #8a4fd0; --green: #1f9d55; --amber: #d98a00; --red: #d93a3a;
+  --oracle: #6b3fb8; --ext: #f3efe6; --hl: #ffe08a; --sel: #e6eefc;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14171d; --panel: #1c2028; --ink: #e5e8ef; --muted: #98a1b3; --line: #2e3442;
+    --cluster: #1f2633; --cluster-line: #3b4760; --agent: #252b36;
+    --ext: #2a2620; --hl: #6b5512; --sel: #24314a;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #14171d; --panel: #1c2028; --ink: #e5e8ef; --muted: #98a1b3; --line: #2e3442;
+  --cluster: #1f2633; --cluster-line: #3b4760; --agent: #252b36;
+  --ext: #2a2620; --hl: #6b5512; --sel: #24314a;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+#app { display: grid; height: 100vh; grid-template-rows: auto 1fr;
+  grid-template-columns: var(--browser-w, 0px) 1fr 440px; }
+header { grid-column: 1 / -1; grid-row: 1; display: flex; align-items: center; gap: 12px; padding: 8px 14px;
+  border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 15px; margin: 0; white-space: nowrap; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px;
+  border: 1px solid var(--line); white-space: nowrap; }
+.b-ok { color: var(--green); border-color: var(--green); }
+.b-bad { color: var(--red); border-color: var(--red); }
+.b-warn { color: var(--amber); border-color: var(--amber); }
+#runinfo { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; color: var(--muted); flex: 1; min-width: 0; }
+#browser { grid-column: 1; grid-row: 2; border-right: 1px solid var(--line); background: var(--panel); overflow: auto; display: none; }
+#browser.on { display: block; }
+#browser input { width: calc(100% - 16px); margin: 8px; padding: 5px 7px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--bg); color: var(--ink); }
+.run-group { padding: 6px 10px 2px; font-size: 11px; color: var(--muted); word-break: break-all; }
+.run-item { padding: 4px 10px; cursor: pointer; display: flex; gap: 6px; align-items: center; }
+.run-item:hover { background: var(--sel); }
+.run-item.cur { background: var(--sel); font-weight: 600; }
+main { grid-column: 2; grid-row: 2; display: grid; grid-template-rows: 1fr auto; min-width: 0; min-height: 0; }
+#stagewrap { position: relative; min-height: 0; overflow: hidden; }
+svg#stage { width: 100%; height: 100%; display: block; }
+#controls { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--line);
+  background: var(--panel); flex-wrap: wrap; }
+button { background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
+  padding: 4px 9px; cursor: pointer; font-size: 13px; }
+button:hover { border-color: var(--blue); }
+button.primary { background: var(--blue); color: #fff; border-color: var(--blue); min-width: 70px; }
+select { background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 3px; }
+#scrub { flex: 1; min-width: 160px; }
+#counter { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 120px; text-align: right; }
+aside { grid-column: 3; grid-row: 2; border-left: 1px solid var(--line); background: var(--panel); display: grid;
+  grid-template-rows: auto minmax(120px, 45%) 1fr; min-height: 0; }
+#filters { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+#filters label { display: flex; gap: 3px; align-items: center; cursor: pointer; }
+#events { overflow: auto; border-bottom: 1px solid var(--line); }
+.ev { display: grid; grid-template-columns: 52px 18px 1fr; gap: 4px; padding: 2px 8px; cursor: pointer;
+  border-left: 3px solid transparent; }
+.ev:hover { background: var(--sel); }
+.ev.cur { background: var(--sel); border-left-color: var(--blue); }
+.ev.future { opacity: .45; }
+.ev .t { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; padding-top: 1px; }
+.ev .s { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#detail { overflow: auto; padding: 10px 12px; }
+#detail h3 { margin: 0 0 6px; font-size: 14px; }
+#detail .kv { display: grid; grid-template-columns: 110px 1fr; gap: 2px 8px; margin-bottom: 8px; }
+#detail .kv div:nth-child(odd) { color: var(--muted); }
+#detail pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px; margin: 4px 0 10px; font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace;
+  max-height: 420px; overflow: auto; }
+#detail .lbl { font-weight: 600; margin-top: 6px; }
+mark { background: var(--hl); color: inherit; border-radius: 2px; }
+.link { color: var(--blue); cursor: pointer; text-decoration: underline; }
+.muted { color: var(--muted); }
+#drop { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+  background: rgba(47,111,223,.12); border: 3px dashed var(--blue); font-size: 18px; }
+#empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: 8px; color: var(--muted); text-align: center; padding: 20px; }
+svg text { fill: var(--ink); font-family: system-ui, sans-serif; }
+.cl-box { fill: var(--cluster); stroke: var(--cluster-line); stroke-width: 1.5; }
+.ag-box { fill: var(--agent); stroke: var(--cluster-line); stroke-width: 1.5; }
+.ag-box.working { stroke: var(--blue); stroke-width: 3; }
+.ag-box.flagged { stroke: var(--red); stroke-dasharray: 5 3; }
+.small { font-size: 11px; fill: var(--muted); }
+.bubble rect { fill: var(--panel); stroke: var(--blue); }
+.bubble.notice rect { stroke: var(--amber); }
+.bubble text { font-size: 11px; }
+@media (max-width: 900px) {
+  #app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto 60vh 60vh; height: auto; }
+  header { flex-wrap: wrap; padding: 8px 16px; }
+  header h1 { font-size: 14px; }
+  #events .ev { grid-template-columns: 44px 18px minmax(0, 1fr); }
+  #browser { grid-column: 1; grid-row: 2; }
+  main { grid-column: 1; grid-row: 3; }
+  aside { grid-column: 1; grid-row: 4; border-left: 0; border-top: 1px solid var(--line); }
+  #browser.on { max-height: 30vh; }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>KAIROS MAS · run viewer</h1>
+    <button id="btnBrowser" title="Runs" style="display:none">☰ Runs</button>
+    <div id="runinfo"></div>
+    <label class="muted" title="Open a result or trace JSON">
+      <input type="file" id="file" accept=".json" style="display:none">
+      <button onclick="document.getElementById('file').click()">Open file…</button>
+    </label>
+    <button id="btnTheme" title="Toggle theme">◐</button>
+  </header>
+  <nav id="browser"><input id="runfilter" placeholder="filter runs…"><div id="runlist"></div></nav>
+  <main>
+    <div id="stagewrap">
+      <svg id="stage" viewBox="0 0 1000 640" preserveAspectRatio="xMidYMid meet"></svg>
+      <div id="empty">
+        <div style="font-size:16px">No run loaded</div>
+        <div>Open a MASDojo result (<code>…/user_task_X/injection_task_Y.json</code>) or drop it here.<br>
+        Or start the viewer on a log directory: <code>python -m kairos.mas.viewer serve evaluation/logs</code></div>
+      </div>
+      <div id="drop">Drop a result JSON</div>
+    </div>
+    <div id="controls">
+      <button id="btnReset" title="Reset (Home)">⏮</button>
+      <button id="btnBack" title="Step back (←)">◀</button>
+      <button id="btnPlay" class="primary" title="Play / pause (space)">▶ Play</button>
+      <button id="btnFwd" title="Step forward (→)">▶|</button>
+      <button id="btnEnd" title="Jump to end (End)">⏭</button>
+      <select id="speed" title="Speed">
+        <option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option>
+        <option value="2">2×</option><option value="4">4×</option><option value="8">8×</option><option value="16">16×</option>
+      </select>
+      <select id="timing" title="Timing">
+        <option value="steps" selected>uniform steps</option>
+        <option value="real">recorded timing</option>
+      </select>
+      <input type="range" id="scrub" min="0" max="0" value="0">
+      <span id="counter">0 / 0</span>
+    </div>
+  </main>
+  <aside>
+    <div id="filters"></div>
+    <div id="events"></div>
+    <div id="detail"><span class="muted">Select an event, or press play.</span></div>
+  </aside>
+</div>
+
+<script id="trace-data" type="application/json">null</script>
+<script>
+"use strict";
+// ---------------------------------------------------------------- vocabulary
+const CATS = {
+  run:       {label: "run",        kinds: ["run.start", "run.end"]},
+  reasoning: {label: "reasoning",  kinds: ["agent.llm", "agent.task", "agent.done", "agent.notice"]},
+  tools:     {label: "tools",      kinds: ["tool.call", "tool.result", "inbound.external"]},
+  messages:  {label: "messages",   kinds: ["msg.send", "msg.outcome", "msg.deliver", "msg.release", "msg.drop"]},
+  monitor:   {label: "monitor",    kinds: ["gate", "resolution", "notice"]},
+  oracle:    {label: "oracle",     kinds: ["oracle.request", "oracle.llm", "oracle.verdict"]},
+};
+const CAT_OF = {};
+for (const [c, v] of Object.entries(CATS)) for (const k of v.kinds) CAT_OF[k] = c;
+const ICON = {
+  "run.start": "▶", "run.end": "■", "agent.task": "◆", "agent.done": "◇", "agent.llm": "💭",
+  "agent.notice": "⚑", "tool.call": "⚙", "tool.result": "↩", "inbound.external": "⇣",
+  "msg.send": "✉", "msg.outcome": "⚖", "msg.deliver": "📥", "msg.release": "⇢", "msg.drop": "✗",
+  "gate": "🛡", "resolution": "⚖", "notice": "⚑", "oracle.request": "?", "oracle.llm": "🧠", "oracle.verdict": "!",
+};
+const DEC_COLOR = {ALLOW: "var(--green)", REVIEW: "var(--amber)", DENY: "var(--red)"};
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+// ---------------------------------------------------------------- state
+let T = null;            // the trace
+let L = null;            // layout
+let S = null;            // replayed state
+let idx = 0;             // number of events applied
+let playing = false, timer = null, anims = [], selected = null;
+const hidden = new Set();
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const short = (s, n = 90) => { s = String(s ?? "").replace(/\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
+
+// ---------------------------------------------------------------- layout
+function layout(trace) {
+  const topo = trace.topology, W = 1000;
+  const clusters = topo.clusters, n = clusters.length;
+  const top = 110, bottom = 455, gap = 18, left = 20, right = 20;
+  const cw = (W - left - right - gap * (n - 1)) / n;
+  const out = {clusters: {}, agents: {}, W, H: 640};
+  clusters.forEach((c, i) => {
+    const x = left + i * (cw + gap);
+    out.clusters[c.id] = {x, y: top, w: cw, h: bottom - top, dp: {x: x + cw - 30, y: top + 16}, c};
+    const m = c.agents.length;
+    const ah = Math.min(78, (bottom - top - 50 - 14 * (m - 1)) / Math.max(m, 1));
+    const aw = Math.min(cw - 36, 230);
+    c.agents.forEach((a, j) => {
+      const ay = top + 44 + j * (ah + 14);
+      const ax = x + (cw - aw) / 2;
+      out.agents[a] = {x: ax, y: ay, w: aw, h: ah, cx: ax + aw / 2, cy: ay + ah / 2,
+                       ep: {x: ax + aw - 4, y: ay + ah - 4}, cluster: c.id};
+    });
+  });
+  out.principal = {x: W / 2 - 150, y: 18, w: 300, h: 46, cx: W / 2, cy: 41};
+  out.ext = {x: 20, y: 520, w: 590, h: 100, cx: 315, cy: 570};
+  out.oracle = {x: 640, y: 520, w: 340, h: 100, cx: 810, cy: 570};
+  return out;
+}
+
+// ---------------------------------------------------------------- replay state
+function freshState() {
+  const st = {agents: {}, clusters: {}, held: {}, counts: {rel: 0, held: 0, rej: 0, exec: 0, toolHeld: 0,
+    blocked: 0, oracle: 0, aborted: 0}, ext: [], oracle: {busy: null, last: null}, end: null, msgText: {}};
+  for (const a of Object.keys(T.topology.agents))
+    st.agents[a] = {status: "idle", tasks: 0, gate: null, flagged: false, last: "", thought: null};
+  for (const c of T.topology.clusters) st.clusters[c.id] = {res: 0, aborted: 0, flash: null};
+  return st;
+}
+
+function apply(st, e) {
+  const A = e.agent && st.agents[e.agent];
+  switch (e.kind) {
+    case "agent.task": if (A) { A.status = "working"; A.tasks++; A.last = "task: " + short(e.text, 40); } break;
+    case "agent.done": if (A) { A.status = "idle"; A.last = "answered"; } break;
+    case "agent.llm": if (A) { A.thought = e.text || (e.tool_calls || []).map(c => "→ " + c.function).join(", ");
+                              A.last = (e.tool_calls || []).length ? "calls " + e.tool_calls.map(c => c.function).join(", ") : "answers"; } break;
+    case "agent.notice": if (A) A.last = "got a KAIROS notice"; break;
+    case "gate": if (A) A.gate = e.decision; break;
+    case "tool.result":
+      if (e.status === "executed") { st.counts.exec++; st.ext.unshift({tool: e.tool, agent: e.agent, ok: !e.error}); }
+      else if (e.status === "held") st.counts.toolHeld++;
+      else if (e.status === "blocked") st.counts.blocked++;
+      st.ext = st.ext.slice(0, 4);
+      break;
+    case "msg.send": st.msgText[e.kmid] = e.text; break;
+    case "msg.outcome":
+      if (e.outcome === "released" || e.outcome === "duplicate") st.counts.rel++;
+      else if (e.outcome === "held") { st.counts.held++; (st.held[e.from] ||= []).push(e.kmid); }
+      else if (e.outcome === "rejected") st.counts.rej++;
+      break;
+    case "msg.release": case "msg.drop":
+      if (st.held[e.from]) st.held[e.from] = st.held[e.from].filter(k => k !== e.kmid);
+      if (e.kind === "msg.drop") st.counts.rej++; else st.counts.rel++;
+      break;
+    case "oracle.request": st.oracle.busy = e.agent; st.counts.oracle++; break;
+    case "oracle.verdict": st.oracle.busy = null; st.oracle.last = {agent: e.agent, ok: e.consistent, why: e.rationale}; break;
+    case "resolution": {
+      const c = st.clusters[e.cluster]; if (c) { c.res++; c.aborted += (e.aborted || []).length; }
+      if ((e.aborted || []).length) { st.counts.aborted += e.aborted.length; if (A) A.flagged = true; }
+      break; }
+    case "run.end": st.end = e; break;
+  }
+}
+
+function stateAt(n) { const st = freshState(); for (let i = 0; i < n; i++) apply(st, T.events[i]); return st; }
+
+// ---------------------------------------------------------------- drawing
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent, text) {
+  const x = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) x.setAttribute(k, v);
+  if (text !== undefined) x.textContent = text;
+  if (parent) parent.appendChild(x);
+  return x;
+}
+function agentPoint(a, where = "center") {
+  const g = L.agents[a];
+  if (!g) return {x: L.principal.cx, y: L.principal.cy};
+  if (where === "ep") return {x: g.ep.x, y: g.ep.y};
+  return {x: g.cx, y: g.cy};
+}
+function boundaryPoint(a, b) {
+  // where the line from agent a towards point b leaves a's cluster box
+  const g = L.agents[a]; if (!g) return agentPoint(a);
+  const c = L.clusters[g.cluster], p = {x: g.cx, y: g.cy};
+  const dx = b.x - p.x, dy = b.y - p.y; let tmin = 1;
+  for (const [edge, val, d, o] of [["x", c.x, dx, p.x], ["x", c.x + c.w, dx, p.x], ["y", c.y, dy, p.y], ["y", c.y + c.h, dy, p.y]]) {
+    if (d === 0) continue; const t = (val - o) / d; if (t > 0 && t < tmin) tmin = t;
+  }
+  return {x: p.x + dx * tmin, y: p.y + dy * tmin};
+}
+
+function draw() {
+  const svg = $("stage"); svg.innerHTML = "";
+  if (!T) return;
+  const st = S;
+  // external boundary
+  el("line", {x1: 10, y1: 490, x2: 990, y2: 490, stroke: css("--muted"), "stroke-dasharray": "6 5"}, svg);
+  el("text", {x: 14, y: 485, class: "small"}, svg, "external boundary (tools · files · network)");
+  // principal
+  const P = L.principal;
+  el("rect", {x: P.x, y: P.y, width: P.w, height: P.h, rx: 23, fill: css("--panel"), stroke: css("--blue")}, svg);
+  el("text", {x: P.cx, y: P.cy - 2, "text-anchor": "middle", "font-weight": 600}, svg, "👤 Principal (user)");
+  el("text", {x: P.cx, y: P.cy + 13, "text-anchor": "middle", class: "small"}, svg, short(T.prompt, 48));
+  // clusters
+  for (const [cid, c] of Object.entries(L.clusters)) {
+    el("rect", {x: c.x, y: c.y, width: c.w, height: c.h, rx: 12, class: "cl-box"}, svg);
+    el("text", {x: c.x + 12, y: c.y + 22, "font-weight": 600}, svg, "cluster " + cid);
+    if (c.c.clearance) el("text", {x: c.x + 12, y: c.y + 36, class: "small"}, svg, "clearance: " + c.c.clearance);
+    const cs = st.clusters[cid];
+    const dpc = cs.flash ? cs.flash : (T.defense === false ? css("--muted") : css("--oracle"));
+    el("rect", {x: c.dp.x - 26, y: c.dp.y - 10, width: 52, height: 22, rx: 6, fill: css("--panel"), stroke: dpc, "stroke-width": cs.flash ? 3 : 1.5}, svg);
+    el("text", {x: c.dp.x, y: c.dp.y + 5, "text-anchor": "middle", "font-size": 11, "font-weight": 600}, svg,
+       T.defense === false ? "no DP" : "DP " + (cs.res ? cs.res : ""));
+    if (cs.aborted) el("text", {x: c.dp.x, y: c.dp.y + 26, "text-anchor": "middle", "font-size": 10, fill: css("--red")}, svg, cs.aborted + " withheld");
+  }
+  // agents
+  for (const [a, g] of Object.entries(L.agents)) {
+    const A = st.agents[a];
+    const cls = "ag-box" + (A.status === "working" ? " working" : "") + (A.flagged ? " flagged" : "");
+    el("rect", {x: g.x, y: g.y, width: g.w, height: g.h, rx: 9, class: cls}, svg);
+    el("text", {x: g.x + 10, y: g.y + 18, "font-weight": 600}, svg, (a === T.topology.entry ? "★ " : "") + a);
+    const tools = (T.topology.agents[a].tools || []);
+    el("text", {x: g.x + 10, y: g.y + 33, class: "small"}, svg, short(tools.length ? tools.join(", ") : "no tools", 38));
+    if (g.h > 52) el("text", {x: g.x + 10, y: g.y + 48, "font-size": 11, fill: css("--blue")}, svg, short(A.last, 36));
+    // enforcement point badge
+    const gc = A.gate ? DEC_COLOR[A.gate] : css("--muted");
+    const ep = el("g", {}, svg);
+    el("path", {d: `M${g.ep.x - 11} ${g.ep.y - 13} h22 v9 c0 8 -6 12 -11 14 c-5 -2 -11 -6 -11 -14 z`,
+                fill: css("--panel"), stroke: T.defense === false ? css("--muted") : gc, "stroke-width": 2}, ep);
+    el("text", {x: g.ep.x, y: g.ep.y + 1, "text-anchor": "middle", "font-size": 8, "font-weight": 700}, ep, "EP");
+    const held = (st.held[a] || []).length;
+    if (held) {
+      el("rect", {x: g.x + g.w - 64, y: g.y + 4, width: 40, height: 16, rx: 8, fill: css("--amber")}, svg);
+      el("text", {x: g.x + g.w - 44, y: g.y + 16, "text-anchor": "middle", "font-size": 10, fill: "#fff"}, svg, "✉ " + held + " held");
+    }
+  }
+  // external world
+  const E = L.ext;
+  el("rect", {x: E.x, y: E.y, width: E.w, height: E.h, rx: 10, fill: css("--ext"), stroke: css("--cluster-line")}, svg);
+  el("text", {x: E.x + 12, y: E.y + 20, "font-weight": 600}, svg, "🌐 External world");
+  el("text", {x: E.x + 12, y: E.y + 36, class: "small"}, svg,
+     `effects executed ${st.counts.exec} · held ${st.counts.toolHeld} · blocked ${st.counts.blocked}`);
+  st.ext.slice(0, 3).forEach((x, i) => el("text", {x: E.x + 14, y: E.y + 54 + i * 15, "font-size": 11, fill: x.ok ? css("--ink") : css("--red")}, svg,
+                               `${x.ok ? "✓" : "✗"} ${x.tool}  ← ${x.agent}`));
+  // oracle
+  const O = L.oracle;
+  el("rect", {x: O.x, y: O.y, width: O.w, height: O.h, rx: 10, fill: css("--panel"), stroke: css("--oracle"),
+              "stroke-width": st.oracle.busy ? 3 : 1.5}, svg);
+  el("text", {x: O.x + 12, y: O.y + 20, "font-weight": 600, fill: css("--oracle")}, svg, "⚖ Oracle " + oracleName());
+  el("text", {x: O.x + 12, y: O.y + 38, class: "small"}, svg, `consulted ${st.counts.oracle}×`);
+  if (st.oracle.busy) el("text", {x: O.x + 12, y: O.y + 56, "font-size": 12, fill: css("--amber")}, svg, "reviewing an effect of " + st.oracle.busy + " …");
+  else if (st.oracle.last) {
+    el("text", {x: O.x + 12, y: O.y + 56, "font-size": 12, fill: st.oracle.last.ok ? css("--green") : css("--red")}, svg,
+       (st.oracle.last.ok ? "✓ consistent" : "✗ inconsistent") + " (" + st.oracle.last.agent + ")");
+    el("text", {x: O.x + 12, y: O.y + 74, class: "small"}, svg, short(st.oracle.last.why, 52));
+  }
+  // counters
+  el("text", {x: 990, y: 30, "text-anchor": "end", class: "small"}, svg,
+     `messages: ${st.counts.rel} released · ${st.counts.held} held · ${st.counts.rej} rejected`);
+  el("text", {x: 990, y: 46, "text-anchor": "end", class: "small"}, svg, `withheld by resolutions: ${st.counts.aborted}`);
+  if (st.end) {
+    const ok = st.end.utility, att = st.end.attack_success;
+    el("text", {x: 990, y: 66, "text-anchor": "end", "font-weight": 600, fill: ok ? css("--green") : css("--red")}, svg,
+       "utility " + (ok ? "✓" : "✗") + (att === null || att === undefined ? "" : (att ? "   ATTACK SUCCEEDED" : "   attack stopped")));
+  }
+  legend(svg);
+  drawCurrent(svg);
+  drawAnims(svg);
+}
+
+function oracleName() {
+  const c = T.config || {};
+  if (T.defense === false) return "(not consulted: defense off)";
+  return c.oracle === "llm" ? "(" + (c.judge_model || "llm") + ")" : c.oracle ? "(" + c.oracle + ")" : "";
+}
+
+function legend(svg) {
+  const items = [["--blue", "request / prompt"], ["--purple", "reply"], ["--green", "approved / executed"],
+                 ["--amber", "held for review"], ["--red", "rejected / blocked"]];
+  items.forEach(([c, t], i) => {
+    el("circle", {cx: 18, cy: 18 + i * 14, r: 5, fill: css(c)}, svg);
+    el("text", {x: 28, y: 22 + i * 14, class: "small"}, svg, t);
+  });
+  [["EP", "enforcement point"], ["", "(colour: last decision)"], ["DP", "cluster decision point"],
+   ["- -", "flagged agent"], ["★", "entry agent"]].forEach(([k, t], i) => {
+    el("text", {x: 145, y: 22 + i * 14, "font-size": 11, "font-weight": 700}, svg, k);
+    el("text", {x: 170, y: 22 + i * 14, class: "small"}, svg, t);
+  });
+}
+
+// the current event: a bubble or highlight that stays while it is current
+function drawCurrent(svg) {
+  if (idx === 0) return;
+  const e = T.events[idx - 1];
+  const g = e.agent && L.agents[e.agent];
+  if ((e.kind === "agent.llm" || e.kind === "agent.notice" || e.kind === "notice") && g) {
+    const text = e.kind === "agent.llm" ? (e.text || (e.tool_calls || []).map(c => "→ " + c.function + "(" + short(JSON.stringify(c.args), 40) + ")").join("\n"))
+                                        : e.text;
+    bubble(svg, g, text, e.kind !== "agent.llm");
+  }
+  if (e.kind === "gate" && g) {
+    el("circle", {cx: g.ep.x, cy: g.ep.y, r: 18, fill: "none", stroke: DEC_COLOR[e.decision] || css("--muted"), "stroke-width": 3}, svg);
+    label(svg, g.ep.x + 20, g.ep.y + 22, `${e.decision} · ${e.by}`, DEC_COLOR[e.decision]);
+  }
+  if (e.kind === "resolution") {
+    const c = L.clusters[e.cluster];
+    if (c) { el("rect", {x: c.dp.x - 30, y: c.dp.y - 14, width: 60, height: 30, rx: 8, fill: "none",
+                         stroke: (e.aborted || []).length ? css("--red") : css("--green"), "stroke-width": 3}, svg);
+             label(svg, c.dp.x - 30, c.dp.y + 40, (e.aborted || []).length ? "withheld: " + e.aborted.map(x => x.tool).join(", ") : "committed: " + (e.committed || []).map(x => x.tool).join(", "),
+                   (e.aborted || []).length ? css("--red") : css("--green")); }
+  }
+  if (e.kind === "run.end") {
+    label(svg, L.principal.x, L.principal.y + L.principal.h + 16, "answer: " + short(e.output, 60), css("--blue"));
+  }
+}
+function label(svg, x, y, text, color) {
+  const t = el("text", {x, y, "font-size": 11, "font-weight": 600, fill: color || css("--ink"),
+                        "paint-order": "stroke", stroke: css("--panel"), "stroke-width": 3}, svg, short(text, 70));
+  return t;
+}
+function bubble(svg, g, text, notice) {
+  const lines = wrap(short(text, 260), 44).slice(0, 6);
+  const w = 290, h = 12 + lines.length * 14;
+  let x = g.x + g.w + 8, y = g.y - 6;
+  if (x + w > 995) x = g.x - w - 8;
+  if (x < 5) { x = g.x; y = g.y + g.h + 6; }
+  const b = el("g", {class: "bubble" + (notice ? " notice" : "")}, svg);
+  el("rect", {x, y, width: w, height: h, rx: 8, "stroke-width": 1.5}, b);
+  lines.forEach((ln, i) => el("text", {x: x + 8, y: y + 16 + i * 14}, b, ln));
+}
+function wrap(s, n) {
+  const out = []; let cur = "";
+  for (const w of s.split(/\s+/)) { if ((cur + " " + w).trim().length > n) { if (cur) out.push(cur); cur = w; } else cur = (cur + " " + w).trim(); }
+  if (cur) out.push(cur); return out;
+}
+
+// ---------------------------------------------------------------- animations
+function spawnAnims(e) {
+  const tok = (from, to, color, text, opts = {}) => anims.push({from, to, color, text, t0: performance.now(), dur: opts.dur || stepMs() * 0.85, stop: opts.stop, x: opts.x});
+  const ag = a => agentPoint(a), ep = a => agentPoint(a, "ep");
+  const O = {x: L.oracle.cx, y: L.oracle.y}, E = {x: L.ext.cx, y: L.ext.y}, P = {x: L.principal.cx, y: L.principal.y + L.principal.h};
+  const dp = a => { const g = L.agents[a]; const c = g && L.clusters[g.cluster]; return c ? {x: c.dp.x, y: c.dp.y} : ag(a); };
+  switch (e.kind) {
+    case "run.start": case "agent.task":
+      if (e.kind === "run.start" || e.task === "principal") tok(P, ag(e.agent), css("--blue"), "prompt");
+      break;
+    case "agent.done": if (e.task === "principal") tok(ag(e.agent), P, css("--blue"), "answer"); break;
+    case "tool.call": tok(ag(e.agent), ep(e.agent), css("--muted"), e.tool); break;
+    case "tool.result":
+      if (e.status === "executed") { tok(ep(e.agent), E, e.error ? css("--red") : css("--green"), e.tool); }
+      else if (e.status === "held") tok(ep(e.agent), {x: ep(e.agent).x, y: 490}, css("--amber"), "held: " + e.tool, {stop: true});
+      else if (e.status === "blocked") tok(ep(e.agent), {x: ep(e.agent).x, y: 490}, css("--red"), "blocked: " + e.tool, {stop: true, x: true});
+      break;
+    case "inbound.external": tok(E, ag(e.agent), css("--red"), "external content"); break;
+    case "msg.send": tok(ag(e.from), ep(e.from), e.reply ? css("--purple") : css("--blue"), "✉ " + (e.reply ? "reply" : "request")); break;
+    case "msg.outcome": {
+      const color = e.outcome === "rejected" ? css("--red") : e.outcome === "held" ? css("--amber") : (S.msgText && false) || css("--blue");
+      if (e.outcome === "released" || e.outcome === "duplicate") tok(ep(e.from), ag(e.to), css("--blue"), "✉ " + e.kmid);
+      else tok(ep(e.from), boundaryPoint(e.from, ag(e.to)), color, (e.outcome === "held" ? "held " : "✗ rejected ") + e.kmid, {stop: true, x: e.outcome === "rejected"});
+      break; }
+    case "msg.release": tok(ep(e.from), ag(e.to), css("--green"), "released " + e.kmid); break;
+    case "msg.drop": tok(ep(e.from), boundaryPoint(e.from, ag(e.to)), css("--red"), "dropped " + e.kmid, {stop: true, x: true}); break;
+    case "msg.deliver": break;
+    case "oracle.request": tok(dp(e.agent), O, css("--amber"), "review?"); break;
+    case "oracle.verdict": tok(O, dp(e.agent), e.consistent ? css("--green") : css("--red"), e.consistent ? "✓" : "✗"); break;
+  }
+}
+function stepMs() { return 900 / +$("speed").value; }
+function drawAnims(svg) {
+  const now = performance.now();
+  anims = anims.filter(a => now - a.t0 < a.dur + (a.stop ? 600 : 0));
+  for (const a of anims) {
+    let p = Math.min(1, (now - a.t0) / a.dur); p = p < .5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+    const x = a.from.x + (a.to.x - a.from.x) * p, y = a.from.y + (a.to.y - a.from.y) * p;
+    el("line", {x1: a.from.x, y1: a.from.y, x2: x, y2: y, stroke: a.color, "stroke-width": 2, "stroke-opacity": .45, "stroke-dasharray": "4 3"}, svg);
+    el("circle", {cx: x, cy: y, r: 7, fill: a.color}, svg);
+    if (a.x && p >= 1) el("text", {x, y: y + 5, "text-anchor": "middle", "font-size": 16, "font-weight": 700, fill: "#fff"}, svg, "✗");
+    label(svg, x + 10, y - 8, a.text, a.color);
+  }
+}
+let raf = null;
+function animate() {
+  draw();
+  if (anims.length) raf = requestAnimationFrame(animate); else raf = null;
+}
+function kick() { if (!raf) raf = requestAnimationFrame(animate); }
+
+// ---------------------------------------------------------------- playback
+function visibleNext(from) { for (let i = from; i < T.events.length; i++) if (!hidden.has(CAT_OF[T.events[i].kind])) return i; return T.events.length - 1; }
+function visiblePrev(from) { for (let i = from; i >= 0; i--) if (!hidden.has(CAT_OF[T.events[i].kind])) return i; return -1; }
+function goTo(n, animateIt) {
+  n = Math.max(0, Math.min(T.events.length, n));
+  if (animateIt && n === idx + 1) { apply(S, T.events[idx]); idx = n; spawnAnims(T.events[n - 1]); }
+  else if (animateIt && n > idx) { for (let i = idx; i < n; i++) apply(S, T.events[i]); idx = n; anims = []; spawnAnims(T.events[n - 1]); }
+  else { S = stateAt(n); idx = n; anims = []; }
+  for (const c of Object.values(S.clusters)) c.flash = null;
+  const cur = T.events[idx - 1];
+  if (cur && cur.kind === "resolution" && S.clusters[cur.cluster]) S.clusters[cur.cluster].flash = (cur.aborted || []).length ? css("--red") : css("--green");
+  selected = idx ? idx - 1 : null;
+  $("scrub").value = idx; $("counter").textContent = `${idx} / ${T.events.length}` + (cur ? `  ·  t=${fmtT(cur.t)}` : "");
+  renderListState(); renderDetail(selected); draw(); kick();
+}
+function stepForward() { if (idx >= T.events.length) { pause(); return; } goTo(visibleNext(idx) + 1, true); }
+function stepBack() { const p = visiblePrev(idx - 2); goTo(p + 1, false); }
+function delayToNext() {
+  if ($("timing").value === "steps" || idx === 0 || idx >= T.events.length) return stepMs();
+  const n = visibleNext(idx), dt = (T.events[n].t - T.events[idx - 1].t) * 1000;
+  return Math.max(60, Math.min(dt, 4000)) / +$("speed").value;
+}
+function play() {
+  if (!T) return; if (idx >= T.events.length) goTo(0, false);
+  playing = true; $("btnPlay").textContent = "⏸ Pause"; schedule();
+}
+function schedule() { clearTimeout(timer); if (!playing) return; timer = setTimeout(() => { stepForward(); if (idx < T.events.length) schedule(); else pause(); }, delayToNext()); }
+function pause() { playing = false; clearTimeout(timer); $("btnPlay").textContent = "▶ Play"; }
+const fmtT = t => T && T.approximate ? `#${Math.round(t)}` : (t < 60 ? t.toFixed(2) + "s" : Math.floor(t / 60) + "m" + (t % 60).toFixed(0).padStart(2, "0") + "s");
+
+// ---------------------------------------------------------------- event list and details
+function summary(e) {
+  const a = e.agent ? `<b>${esc(e.agent)}</b> ` : "";
+  switch (e.kind) {
+    case "run.start": return "prompt: " + esc(short(e.prompt, 80));
+    case "run.end": return `end · utility ${e.utility ? "✓" : "✗"}` + (e.attack_success == null ? "" : ` · attack ${e.attack_success ? "SUCCEEDED" : "stopped"}`);
+    case "agent.task": return a + "starts a task: " + esc(short(e.text, 70));
+    case "agent.done": return a + "answers: " + esc(short(e.text, 70));
+    case "agent.llm": return a + ((e.tool_calls || []).length ? "→ " + esc(e.tool_calls.map(c => c.function).join(", ")) + " " : "") + esc(short(e.text, 60));
+    case "agent.notice": return a + "receives notice: " + esc(short(e.text, 60));
+    case "tool.call": return a + "calls <code>" + esc(e.tool) + "</code> " + esc(short(JSON.stringify(e.args || {}), 50));
+    case "tool.result": return a + `<code>${esc(e.tool)}</code> ` + tag(e.status) + " " + esc(short(e.error || e.text, 50));
+    case "gate": return a + "gate " + decTag(e.decision) + ` ${esc(e.target)} <span class="muted">(${esc(e.by)})</span>`;
+    case "msg.send": return `✉ <b>${esc(e.from)}</b>→<b>${esc(e.to)}</b> ${e.reply ? "reply" : "request"}${e.intra ? " (intra-cluster)" : ""}: ` + esc(short(e.text, 50));
+    case "msg.outcome": return `${esc(e.kmid)} ${tag(e.outcome)} <span class="muted">${esc(e.by || "")}</span> ` + esc(short(e.reason, 50));
+    case "msg.deliver": return `${esc(e.kmid)} delivered to <b>${esc(e.to)}</b>`;
+    case "msg.release": return `${esc(e.kmid)} ${tag("released")} after review`;
+    case "msg.drop": return `${esc(e.kmid)} ${tag("dropped")} ` + esc(short(e.reason, 60));
+    case "oracle.request": return `oracle asked about ${esc(e.agent)}: ` + esc((e.pending || []).map(p => p.tool).join(", "));
+    case "oracle.llm": return "oracle model: " + esc(short(e.raw, 70));
+    case "oracle.verdict": return `oracle: ${e.consistent ? tag("consistent") : tag("inconsistent")} ` + esc(short(e.rationale, 60));
+    case "resolution": return a + `resolution (${esc(e.trigger)}): ` + ((e.aborted || []).length ? tag("withheld") + " " + esc(e.aborted.map(x => x.tool).join(", ")) : tag("committed") + " " + esc((e.committed || []).map(x => x.tool).join(", ")));
+    case "notice": return a + "KAIROS notice queued: " + esc(short(e.text, 50));
+    case "inbound.external": return a + "external content from " + esc(e.source);
+  }
+  return esc(e.kind);
+}
+function tag(s) {
+  const good = ["executed", "released", "consistent", "committed", "delivered", "duplicate"], bad = ["blocked", "rejected", "inconsistent", "withheld", "dropped"];
+  const cls = good.includes(s) ? "b-ok" : bad.includes(s) ? "b-bad" : "b-warn";
+  return `<span class="badge ${cls}">${esc(s)}</span>`;
+}
+function decTag(d) { return `<span class="badge ${d === "ALLOW" ? "b-ok" : d === "DENY" ? "b-bad" : "b-warn"}">${esc(d)}</span>`; }
+
+function renderList() {
+  const box = $("events"); box.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  T.events.forEach((e, i) => {
+    const d = document.createElement("div");
+    d.className = "ev"; d.dataset.i = i;
+    if (hidden.has(CAT_OF[e.kind])) d.style.display = "none";
+    d.innerHTML = `<span class="t">${fmtT(e.t)}</span><span>${ICON[e.kind] || "·"}</span><span class="s">${summary(e)}</span>`;
+    d.onclick = () => { pause(); goTo(i + 1, false); };
+    frag.appendChild(d);
+  });
+  box.appendChild(frag);
+  renderListState();
+}
+function renderListState() {
+  const rows = $("events").children;
+  for (const r of rows) {
+    const i = +r.dataset.i;
+    r.classList.toggle("cur", i === idx - 1);
+    r.classList.toggle("future", i >= idx);
+  }
+  const cur = rows[idx - 1];
+  if (cur && cur.style.display !== "none") cur.scrollIntoView({block: "nearest"});
+}
+
+let MARKS = [];
+function markers() {
+  const pats = ["<INFORMATION>", "</INFORMATION>", "important message from me", "ignore previous instructions", "ignore all previous instructions"];
+  const goal = T.injection_goal || "";
+  for (const m of goal.match(/[A-Z]{2}\d{10,}|[\w.+-]+@[\w-]+\.[\w.]+|https?:\/\/\S+|\b\w*_\w+\b|\b[\w-]*\d[\w-]{5,}\b/g) || []) pats.push(m.replace(/[.,;]$/, ""));
+  MARKS = [...new Set(pats.filter(p => p.length >= 6))];
+}
+function hl(text) {
+  let s = esc(text);
+  for (const m of MARKS) {
+    const re = new RegExp(esc(m).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    s = s.replace(re, x => `<mark title="injected / attacker value">${x}</mark>`);
+  }
+  return s;
+}
+function renderDetail(i) {
+  const box = $("detail");
+  if (i === null || i === undefined || !T.events[i]) { box.innerHTML = '<span class="muted">Select an event, or press play.</span>'; return; }
+  const e = T.events[i];
+  const LONG = ["text", "prompt", "system", "raw", "rationale", "reason", "output", "notice", "error"];
+  const STRUCT = ["args", "tool_calls", "pending", "committed", "aborted", "flagged", "per_action", "errors"];
+  const kv = Object.entries(e).filter(([k]) => !["i", "t", "kind"].includes(k) && !LONG.includes(k) && !STRUCT.includes(k));
+  let h = `<h3>${ICON[e.kind] || ""} ${esc(e.kind)} <span class="muted" style="font-weight:400">#${i} · ${fmtT(e.t)}</span></h3>`;
+  h += `<div>${summary(e)}</div><div class="kv" style="margin-top:8px">` + kv.map(([k, v]) => `<div>${esc(k)}</div><div>${esc(typeof v === "object" ? JSON.stringify(v) : v)}</div>`).join("") + "</div>";
+  for (const k of STRUCT) if (e[k] !== undefined && !(Array.isArray(e[k]) && !e[k].length)) h += `<div class="lbl">${esc(k)}</div><pre>${hl(JSON.stringify(e[k], null, 2))}</pre>`;
+  for (const k of LONG) if (e[k]) h += `<div class="lbl">${esc(k === "prompt" && e.kind === "oracle.llm" ? "oracle prompt" : k)}</div><pre>${hl(e[k])}</pre>`;
+  const rel = [];
+  T.events.forEach((x, j) => {
+    if (j === i) return;
+    if ((e.kmid && x.kmid === e.kmid) || (e.call_id && x.call_id === e.call_id) ||
+        (e.kind.startsWith("oracle") && x.kind.startsWith("oracle") && x.agent === e.agent && Math.abs(j - i) <= 3)) rel.push(j);
+  });
+  if (rel.length) h += `<div class="lbl">related events</div><div>` + rel.map(j => `<div><span class="link" data-j="${j}">#${j} ${esc(T.events[j].kind)}</span> <span class="muted">${esc(short(T.events[j].outcome || T.events[j].status || T.events[j].decision || "", 30))}</span></div>`).join("") + "</div>";
+  box.innerHTML = h;
+  box.querySelectorAll(".link").forEach(l => l.onclick = () => { pause(); goTo(+l.dataset.j + 1, false); });
+}
+
+function renderFilters() {
+  const f = $("filters"); f.innerHTML = "";
+  for (const [c, v] of Object.entries(CATS)) {
+    const lab = document.createElement("label");
+    lab.innerHTML = `<input type="checkbox" ${hidden.has(c) ? "" : "checked"}> ${v.label}`;
+    lab.querySelector("input").onchange = ev => { ev.target.checked ? hidden.delete(c) : hidden.add(c); renderList(); };
+    f.appendChild(lab);
+  }
+}
+function renderInfo() {
+  const r = T.result || {};
+  const cfg = T.config || {};
+  const parts = [];
+  parts.push(`<b>${esc(T.suite || "")}</b> · ${esc(T.user_task || "")} · ${esc(T.injection_task || "benign")}`);
+  parts.push(`<span class="badge">${esc(cfg.layout || "")} layout</span>`);
+  parts.push(`<span class="badge">${T.defense === false ? "defense off" : "defense on" + (cfg.oracle ? " · oracle " + esc(cfg.oracle === "llm" ? cfg.judge_model : cfg.oracle) : "")}</span>`);
+  if (cfg.backend) parts.push(`<span class="badge">${esc(cfg.backend === "llm" ? "agents: " + cfg.model : "scripted agents")}</span>`);
+  if (r.utility !== undefined) parts.push(`<span class="badge ${r.utility ? "b-ok" : "b-bad"}">utility ${r.utility ? "✓" : "✗"}</span>`);
+  if (r.attack_success !== undefined && r.attack_success !== null) parts.push(`<span class="badge ${r.attack_success ? "b-bad" : "b-ok"}">attack ${r.attack_success ? "succeeded" : "stopped"}</span>`);
+  if (T.approximate) parts.push(`<span class="badge b-warn" title="${esc(T.source || "")}">approximate order (no recorded trace)</span>`);
+  $("runinfo").innerHTML = parts.join(" ");
+}
+
+function load(trace) {
+  pause();
+  T = trace; L = layout(T); markers(); S = freshState(); idx = 0; anims = [];
+  $("empty").style.display = "none";
+  $("scrub").max = T.events.length;
+  renderInfo(); renderFilters(); renderList(); goTo(0, false);
+}
+
+// ---------------------------------------------------------------- run browser (serve mode)
+let RUNS = [], CURRENT = null;
+async function initBrowser() {
+  try {
+    const r = await fetch("api/runs"); if (!r.ok) return false;
+    RUNS = await r.json();
+  } catch { return false; }
+  $("browser").classList.add("on"); $("btnBrowser").style.display = "";
+  document.documentElement.style.setProperty("--browser-w", "300px");
+  renderRuns();
+  const want = new URLSearchParams(location.search).get("run");
+  if (want) openRun(want); else if (RUNS.length) openRun(RUNS[0].path);
+  return true;
+}
+function renderRuns() {
+  const q = $("runfilter").value.toLowerCase(), box = $("runlist"); box.innerHTML = "";
+  let group = null;
+  for (const r of RUNS) {
+    const label = `${r.path}`;
+    if (q && !label.toLowerCase().includes(q)) continue;
+    if (r.group !== group) { group = r.group; const g = document.createElement("div"); g.className = "run-group"; g.textContent = group; box.appendChild(g); }
+    const d = document.createElement("div");
+    d.className = "run-item" + (r.path === CURRENT ? " cur" : "");
+    d.innerHTML = `<span title="${r.traced ? "recorded trace" : "reconstructed (approximate)"}">${r.traced ? "●" : "○"}</span>` +
+      `<span style="flex:1">${esc(r.user_task)} · ${esc(r.injection_task || "benign")}</span>` +
+      `<span class="badge ${r.utility ? "b-ok" : "b-bad"}">U</span>` +
+      (r.attack_success === null || r.attack_success === undefined ? "" : `<span class="badge ${r.attack_success ? "b-bad" : "b-ok"}">A</span>`);
+    d.onclick = () => openRun(r.path);
+    box.appendChild(d);
+  }
+}
+async function openRun(path) {
+  CURRENT = path; renderRuns();
+  history.replaceState(null, "", "?run=" + encodeURIComponent(path));
+  const r = await fetch("api/trace?path=" + encodeURIComponent(path));
+  if (!r.ok) { alert("could not load " + path + ": " + (await r.text())); return; }
+  load(await r.json());
+}
+
+// ---------------------------------------------------------------- wiring
+$("btnPlay").onclick = () => playing ? pause() : play();
+$("btnFwd").onclick = () => { pause(); stepForward(); };
+$("btnBack").onclick = () => { pause(); stepBack(); };
+$("btnReset").onclick = () => { pause(); goTo(0, false); };
+$("btnEnd").onclick = () => { pause(); goTo(T.events.length, false); };
+$("scrub").oninput = ev => { pause(); goTo(+ev.target.value, false); };
+$("speed").onchange = () => { if (playing) schedule(); };
+$("timing").onchange = () => { if (playing) schedule(); };
+$("runfilter").oninput = renderRuns;
+$("btnBrowser").onclick = () => {
+  const on = $("browser").classList.toggle("on");
+  document.documentElement.style.setProperty("--browser-w", on ? "300px" : "0px");
+};
+$("btnTheme").onclick = () => {
+  const cur = document.documentElement.dataset.theme;
+  const dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = dark ? "light" : "dark"; draw();
+};
+document.addEventListener("keydown", ev => {
+  if (!T || ev.target.tagName === "INPUT") return;
+  if (ev.key === " ") { ev.preventDefault(); playing ? pause() : play(); }
+  else if (ev.key === "ArrowRight") { pause(); stepForward(); }
+  else if (ev.key === "ArrowLeft") { pause(); stepBack(); }
+  else if (ev.key === "Home") { pause(); goTo(0, false); }
+  else if (ev.key === "End") { pause(); goTo(T.events.length, false); }
+});
+function readFile(f) {
+  f.text().then(txt => {
+    const d = JSON.parse(txt);
+    const trace = d.events && d.topology ? d : d.trace;
+    if (!trace) { alert("This result has no recorded trace. Reconstruct it with:\n  python -m kairos.mas.viewer export " + f.name + "\nor browse it with:  python -m kairos.mas.viewer serve <logdir>"); return; }
+    trace.result ||= {utility: d.utility, attack_success: d.attack_success, output: d.output};
+    load(trace);
+  }).catch(err => alert("not a result or trace JSON: " + err));
+}
+$("file").onchange = ev => ev.target.files[0] && readFile(ev.target.files[0]);
+const wrapEl = $("stagewrap");
+wrapEl.addEventListener("dragover", ev => { ev.preventDefault(); $("drop").style.display = "flex"; });
+wrapEl.addEventListener("dragleave", () => $("drop").style.display = "none");
+wrapEl.addEventListener("drop", ev => { ev.preventDefault(); $("drop").style.display = "none"; if (ev.dataTransfer.files[0]) readFile(ev.dataTransfer.files[0]); });
+
+(async () => {
+  const embedded = JSON.parse($("trace-data").textContent);
+  if (embedded) { load(embedded); return; }
+  await initBrowser();
+})();
+</script>
+</body>
+</html>
