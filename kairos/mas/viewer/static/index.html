@@ -62,7 +62,7 @@ aside { grid-column: 3; grid-row: 2; border-left: 1px solid var(--line); backgro
 #filters { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
 #filters label { display: flex; gap: 3px; align-items: center; cursor: pointer; }
 #events { overflow: auto; border-bottom: 1px solid var(--line); }
-.ev { display: grid; grid-template-columns: 52px 18px 1fr; gap: 4px; padding: 2px 8px; cursor: pointer;
+.ev { display: grid; grid-template-columns: 62px 18px 1fr; gap: 4px; padding: 2px 8px; cursor: pointer;
   border-left: 3px solid transparent; }
 .ev:hover { background: var(--sel); }
 .ev.cur { background: var(--sel); border-left-color: var(--blue); }
@@ -84,7 +84,7 @@ mark { background: var(--hl); color: inherit; border-radius: 2px; }
   background: rgba(47,111,223,.12); border: 3px dashed var(--blue); font-size: 18px; }
 #empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   flex-direction: column; gap: 8px; color: var(--muted); text-align: center; padding: 20px; }
-svg text { fill: var(--ink); font-family: system-ui, sans-serif; }
+svg text { fill: var(--ink); font-family: system-ui, sans-serif; pointer-events: none; }
 .cl-box { fill: var(--cluster); stroke: var(--cluster-line); stroke-width: 1.5; }
 .ag-box { fill: var(--agent); stroke: var(--cluster-line); stroke-width: 1.5; }
 .ag-box.working { stroke: var(--blue); stroke-width: 3; }
@@ -97,7 +97,7 @@ svg text { fill: var(--ink); font-family: system-ui, sans-serif; }
   #app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto 60vh 60vh; height: auto; }
   header { flex-wrap: wrap; padding: 8px 16px; }
   header h1 { font-size: 14px; }
-  #events .ev { grid-template-columns: 44px 18px minmax(0, 1fr); }
+  #events .ev { grid-template-columns: 58px 18px minmax(0, 1fr); }
   #browser { grid-column: 1; grid-row: 2; }
   main { grid-column: 1; grid-row: 3; }
   aside { grid-column: 1; grid-row: 4; border-left: 0; border-top: 1px solid var(--line); }
@@ -111,6 +111,7 @@ svg text { fill: var(--ink); font-family: system-ui, sans-serif; }
     <h1>KAIROS MAS · run viewer</h1>
     <button id="btnBrowser" title="Runs" style="display:none">☰ Runs</button>
     <div id="runinfo"></div>
+    <button id="btnPolicies" title="Policies of the system, its clusters and agents">Policies</button>
     <label class="muted" title="Open a result or trace JSON">
       <input type="file" id="file" accept=".json" style="display:none">
       <button onclick="document.getElementById('file').click()">Open file…</button>
@@ -300,12 +301,12 @@ function draw() {
   el("text", {x: P.cx, y: P.cy + 13, "text-anchor": "middle", class: "small"}, svg, short(T.prompt, 48));
   // clusters
   for (const [cid, c] of Object.entries(L.clusters)) {
-    el("rect", {x: c.x, y: c.y, width: c.w, height: c.h, rx: 12, class: "cl-box"}, svg);
+    el("rect", {x: c.x, y: c.y, width: c.w, height: c.h, rx: 12, class: "cl-box", "data-cluster": cid, style: "cursor:pointer"}, svg);
     el("text", {x: c.x + 12, y: c.y + 22, "font-weight": 600}, svg, "cluster " + cid);
     if (c.c.clearance) el("text", {x: c.x + 12, y: c.y + 36, class: "small"}, svg, "clearance: " + c.c.clearance);
     const cs = st.clusters[cid];
     const dpc = cs.flash ? cs.flash : (T.defense === false ? css("--muted") : css("--oracle"));
-    el("rect", {x: c.dp.x - 26, y: c.dp.y - 10, width: 52, height: 22, rx: 6, fill: css("--panel"), stroke: dpc, "stroke-width": cs.flash ? 3 : 1.5}, svg);
+    el("rect", {x: c.dp.x - 26, y: c.dp.y - 10, width: 52, height: 22, rx: 6, fill: css("--panel"), stroke: dpc, "stroke-width": cs.flash ? 3 : 1.5, "data-cluster": cid, style: "cursor:pointer"}, svg);
     el("text", {x: c.dp.x, y: c.dp.y + 5, "text-anchor": "middle", "font-size": 11, "font-weight": 600}, svg,
        T.defense === false ? "no DP" : "DP " + (cs.res ? cs.res : ""));
     if (cs.aborted) el("text", {x: c.dp.x, y: c.dp.y + 26, "text-anchor": "middle", "font-size": 10, fill: css("--red")}, svg, cs.aborted + " withheld");
@@ -314,7 +315,7 @@ function draw() {
   for (const [a, g] of Object.entries(L.agents)) {
     const A = st.agents[a];
     const cls = "ag-box" + (A.status === "working" ? " working" : "") + (A.flagged ? " flagged" : "");
-    el("rect", {x: g.x, y: g.y, width: g.w, height: g.h, rx: 9, class: cls}, svg);
+    el("rect", {x: g.x, y: g.y, width: g.w, height: g.h, rx: 9, class: cls, "data-agent": a, style: "cursor:pointer"}, svg);
     el("text", {x: g.x + 10, y: g.y + 18, "font-weight": 600}, svg, (a === T.topology.entry ? "★ " : "") + a);
     const tools = (T.topology.agents[a].tools || []);
     el("text", {x: g.x + 10, y: g.y + 33, class: "small"}, svg, short(tools.length ? tools.join(", ") : "no tools", 38));
@@ -510,7 +511,12 @@ function play() {
 }
 function schedule() { clearTimeout(timer); if (!playing) return; timer = setTimeout(() => { stepForward(); if (idx < T.events.length) schedule(); else pause(); }, delayToNext()); }
 function pause() { playing = false; clearTimeout(timer); $("btnPlay").textContent = "▶ Play"; }
-const fmtT = t => T && T.approximate ? `#${Math.round(t)}` : (t < 60 ? t.toFixed(2) + "s" : Math.floor(t / 60) + "m" + (t % 60).toFixed(0).padStart(2, "0") + "s");
+function fmtT(t) {
+  if (T && T.approximate) return `#${Math.round(t)}`;
+  if (t < 1) return (t * 1000).toFixed(t < 0.01 ? 2 : 1) + " ms";
+  if (t < 60) return t.toFixed(2) + " s";
+  return Math.floor(t / 60) + " min " + (t % 60).toFixed(0).padStart(2, "0") + " s";
+}
 
 // ---------------------------------------------------------------- event list and details
 function summary(e) {
@@ -554,7 +560,7 @@ function renderList() {
     d.className = "ev"; d.dataset.i = i;
     if (hidden.has(CAT_OF[e.kind])) d.style.display = "none";
     d.innerHTML = `<span class="t">${fmtT(e.t)}</span><span>${ICON[e.kind] || "·"}</span><span class="s">${summary(e)}</span>`;
-    d.onclick = () => { pause(); goTo(i + 1, false); };
+    d.onclick = () => { pause(); policyView = null; goTo(i + 1, false); };
     frag.appendChild(d);
   });
   box.appendChild(frag);
@@ -586,8 +592,67 @@ function hl(text) {
   }
   return s;
 }
+let policyView = null;      // {kind: "all"|"cluster"|"agent", id}: shown instead of the current event
+function yaml(v, ind = "") {
+  if (v === null || v === undefined) return "null";
+  if (Array.isArray(v)) {
+    if (!v.length) return "[]";
+    return v.map(x => {
+      const body = yaml(x, ind + "  ");
+      return "\n" + ind + "- " + (typeof x === "object" && x !== null && !Array.isArray(x) ? body.replace(/^\n\s*/, "") : body.trim());
+    }).join("");
+  }
+  if (typeof v === "object") {
+    const ks = Object.keys(v); if (!ks.length) return "{}";
+    return ks.map(k => {
+      const x = v[k], scalar = x === null || typeof x !== "object" || (Array.isArray(x) && !x.length) || (!Array.isArray(x) && !Object.keys(x).length);
+      return "\n" + ind + k + ":" + (scalar ? " " + yaml(x, ind + "  ") : yaml(x, ind + "  "));
+    }).join("");
+  }
+  return typeof v === "string" && /[:#\n]/.test(v) ? JSON.stringify(v) : String(v);
+}
+function showPolicy(kind, id) { policyView = {kind, id}; renderDetail(selected); }
+function renderPolicy(box) {
+  const P = (T.topology || {}).policy;
+  const close = ' <span class="link" id="closePolicy" style="font-size:12px;font-weight:400">close</span>';
+  if (!P) { box.innerHTML = "<h3>Policies" + close + '</h3><div class="muted">This trace carries no policy.</div>'; }
+  else if (policyView.kind === "cluster") {
+    const c = P.clusters[policyView.id] || {};
+    const members = Object.entries(P.agents).filter(([, a]) => a.cluster === policyView.id).map(([n]) => n);
+    box.innerHTML = `<h3>Cluster ${esc(policyView.id)} — policy${close}</h3>` +
+      `<div class="kv"><div>clearance</div><div>${esc(c.clearance)}</div><div>agents</div><div>${members.map(m => `<span class="link" data-agent="${esc(m)}">${esc(m)}</span>`).join(", ")}</div>` +
+      `<div>decision point</div><div>DP of ${esc(policyView.id)}: decides the effects and outbound messages of these agents</div></div>` +
+      `<div class="lbl">policy (as declared in the system spec)</div><pre>${esc(yaml(c.policy || {}).trim())}</pre>`;
+  } else if (policyView.kind === "agent") {
+    const a = P.agents[policyView.id] || {}, topo = T.topology.agents[policyView.id] || {};
+    box.innerHTML = `<h3>Agent ${esc(policyView.id)} — policy${close}</h3>` +
+      `<div class="kv"><div>cluster</div><div><span class="link" data-cluster="${esc(a.cluster)}">${esc(a.cluster)}</span> (cluster policy applies too)</div>` +
+      `<div>endpoint</div><div>${esc(a.endpoint)}</div><div>description</div><div>${esc(a.description)}</div>` +
+      `<div>tools</div><div>${esc((topo.tools || []).join(", ") || "none")}</div></div>` +
+      `<div class="lbl">agent policy (as declared in the system spec)</div><pre>${esc(yaml(a.policy || {}).trim())}</pre>`;
+  } else {
+    let h = `<h3>Policies${close}</h3><div class="kv"><div>system</div><div>${esc((P.system || {}).name || "")}</div><div>entry agent</div><div>${esc((P.system || {}).entry || T.topology.entry)}</div></div>`;
+    for (const [cid, c] of Object.entries(P.clusters)) {
+      const pol = c.policy || {};
+      const members = Object.entries(P.agents).filter(([, a]) => a.cluster === cid).map(([n]) => n);
+      h += `<div class="lbl"><span class="link" data-cluster="${esc(cid)}">cluster ${esc(cid)}</span> · clearance ${esc(c.clearance)}</div>` +
+        `<div class="kv"><div>agents</div><div>${members.map(m => `<span class="link" data-agent="${esc(m)}">${esc(m)}</span>`).join(", ")}</div>` +
+        `<div>default action</div><div>${esc(pol.default_action)}</div>` +
+        `<div>messages</div><div>identifiers: ${esc(pol.message_identifiers)}${pol.message_review ? " · review: " + esc(pol.message_review) : ""} · intra-cluster: ${esc(pol.intra_cluster_checks)}</div>` +
+        `<div>may message</div><div>${esc(((((pol.contact_book || {}).peers || {}).entries) || []).map(e => e.cluster || e.agent).join(", ") || "—")} (else ${esc((((pol.contact_book || {}).peers || {}).on_miss) || "—")})</div>` +
+        `<div>rules</div><div>${esc((pol.rules || []).map(r => r.id + " → " + r.decision).join("; ") || "none")}</div></div>`;
+    }
+    h += '<div class="muted">Click a cluster, its DP badge or an agent in the diagram for its full policy.</div>';
+    box.innerHTML = h;
+  }
+  const c = box.querySelector("#closePolicy"); if (c) c.onclick = () => { policyView = null; renderDetail(selected); };
+  box.querySelectorAll("[data-agent]").forEach(l => l.onclick = () => showPolicy("agent", l.dataset.agent));
+  box.querySelectorAll("[data-cluster]").forEach(l => l.onclick = () => showPolicy("cluster", l.dataset.cluster));
+}
+
 function renderDetail(i) {
   const box = $("detail");
+  if (policyView) { renderPolicy(box); return; }
   if (i === null || i === undefined || !T.events[i]) { box.innerHTML = '<span class="muted">Select an event, or press play.</span>'; return; }
   const e = T.events[i];
   const LONG = ["text", "prompt", "system", "raw", "rationale", "reason", "output", "notice", "error"];
@@ -633,7 +698,7 @@ function renderInfo() {
 
 function load(trace) {
   pause();
-  T = trace; L = layout(T); markers(); S = freshState(); idx = 0; anims = [];
+  T = trace; L = layout(T); markers(); policyView = null; S = freshState(); idx = 0; anims = [];
   $("empty").style.display = "none";
   $("scrub").max = T.events.length;
   renderInfo(); renderFilters(); renderList(); goTo(0, false);
@@ -680,6 +745,12 @@ async function openRun(path) {
 
 // ---------------------------------------------------------------- wiring
 $("btnPlay").onclick = () => playing ? pause() : play();
+$("btnPolicies").onclick = () => T && showPolicy("all");
+$("stage").addEventListener("click", ev => {
+  const t = ev.target.closest("[data-agent],[data-cluster]");
+  if (!t || !T) return;
+  t.dataset.agent ? showPolicy("agent", t.dataset.agent) : showPolicy("cluster", t.dataset.cluster);
+});
 $("btnFwd").onclick = () => { pause(); stepForward(); };
 $("btnBack").onclick = () => { pause(); stepBack(); };
 $("btnReset").onclick = () => { pause(); goTo(0, false); };

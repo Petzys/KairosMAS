@@ -95,7 +95,15 @@ def topology(spec: Any, tools_of: Any = None) -> dict[str, Any]:
     agents = {a: {"cluster": ag.cluster, "description": ag.description, "endpoint": ag.endpoint,
                   "tools": list(tools_of(a)) if tools_of else []}
               for a, ag in spec.agents.items()}
-    return {"entry": spec.entry, "clusters": clusters, "agents": agents}
+    out = {"entry": spec.entry, "clusters": clusters, "agents": agents}
+    try:                                       # the declared policies, as the spec file states them
+        from kairos.mas.spec_parser import spec_to_dict
+        d = spec_to_dict(spec)
+        out["policy"] = {"system": d.get("system", {}), "clusters": d.get("clusters", {}),
+                         "agents": d.get("agents", {})}
+    except Exception:                         # noqa: BLE001 - the viewer works without it
+        pass
+    return out
 
 
 def emit(fabric: Any, kind: str, **data: Any) -> None:

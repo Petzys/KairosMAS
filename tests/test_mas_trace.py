@@ -135,3 +135,12 @@ def test_the_server_lists_runs_and_stays_in_its_directory(tmp_path) -> None:
         with pytest.raises(PermissionError):
             idx.resolve(bad)
     assert make_handler(idx) is not None
+
+
+def test_traces_carry_the_declared_policies() -> None:
+    _, r = _pair("user_task_0", None)
+    pol = r.trace["topology"]["policy"]
+    assert set(pol["clusters"]) == {"front", "finance", "docs"} and set(pol["agents"]) == set(r.trace["topology"]["agents"])
+    assert pol["clusters"]["finance"]["clearance"] == "high"
+    assert pol["clusters"]["finance"]["policy"]["contact_book"]["peers"]["on_miss"] == "DENY"
+    assert "send_money" in pol["agents"]["payments"]["policy"]["actions"]["non_revertable"]

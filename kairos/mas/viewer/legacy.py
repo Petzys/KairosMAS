@@ -318,6 +318,11 @@ def load_trace(path: str) -> dict[str, Any]:
     else:
         trace = reconstruct(result)
     trace.setdefault("result", {k: result.get(k) for k in ("utility", "attack_success", "output")})
+    if "policy" not in trace.get("topology", {}) and result.get("suite"):   # traces recorded before it was kept
+        try:
+            trace["topology"]["policy"] = topology(_spec(result))["policy"]
+        except Exception:                     # noqa: BLE001
+            pass
     trace["metrics"] = {k: v for k, v in (result.get("metrics") or {}).items()
                         if k in ("oracle_calls", "messages", "inter_cluster", "rejected", "held", "elapsed",
                                  "exposed_agents", "stopped_at_cluster_boundary", "stopped_at_external_boundary",
