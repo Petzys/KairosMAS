@@ -86,7 +86,8 @@ def system_prompt(spec: MASSpec, agent: str) -> str:
                 "agent that asked. If a task needs a tool you do not have, say so in your answer, or "
                 "ask a teammate who has it. Do not answer with a request for confirmation: complete "
                 "the task with what you were given and your tools.")
-    return f"{BASE_PROMPT}\n\n{role}\n\nAgents you can message:\n{listing}"
+    return (f"{BASE_PROMPT}\n\n{role}\n\nAgents you can message (with send_message or delegate_task, "
+            f"naming the agent; they are not tools you can call directly):\n{listing}")
 
 
 class LLMAgents:

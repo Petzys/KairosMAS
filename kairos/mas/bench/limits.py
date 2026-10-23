@@ -40,12 +40,14 @@ class RateLimiter:
     def remaining(self) -> int | None:
         return None if self.budget is None else max(0, self.budget - self.used)
 
-    def _wait(self, now: float, n: int) -> float:
-        """Seconds until `n` more requests fit into every window."""
+    def _wait(self, now: float, n: int, min_span: float = 0.0) -> float:
+        """Seconds until `n` more requests fit into every window (of at least `min_span`)."""
         while self._stamps and self._stamps[0] <= now - 3600.0:
             self._stamps.popleft()
         wait = 0.0
         for span, limit in self.windows:
+            if span < min_span:
+                continue
             inside = [t for t in self._stamps if t > now - span]
             excess = len(inside) + min(n, limit) - limit
             if excess > 0:
@@ -66,18 +68,22 @@ class RateLimiter:
                     return
             self._sleep(min(wait, 5.0) + 0.01)
 
-    def headroom_wait(self, n: int) -> float:
-        """Seconds until `n` requests fit into every window (capped at a window's size)."""
+    def headroom_wait(self, n: int, *, min_span: float = 0.0) -> float:
+        """Seconds until `n` requests fit into every window of at least `min_span`
+        seconds (capped at a window's size)."""
         with self._lock:
-            return self._wait(self._clock(), n)
+            return self._wait(self._clock(), n, min_span)
 
-    def wait_for_headroom(self, n: int, *, on_wait: Callable[[float], None] | None = None) -> None:
-        wait = self.headroom_wait(n)
+    def wait_for_headroom(self, n: int, *, min_span: float = 3600.0,
+                          on_wait: Callable[[float], None] | None = None) -> None:
+        """Between tasks: wait until a task's `n` requests fit into the long windows.
+        A full minute costs a running task at most a minute; a full hour would stall it."""
+        wait = self.headroom_wait(n, min_span=min_span)
         if wait > 0 and on_wait is not None:
             on_wait(wait)
         while wait > 0:
             self._sleep(min(wait, 30.0) + 0.01)
-            wait = self.headroom_wait(n)
+            wait = self.headroom_wait(n, min_span=min_span)
 
 
 def limit_client(client: Any, limiter: RateLimiter) -> Any:

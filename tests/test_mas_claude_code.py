@@ -154,7 +154,8 @@ def test_headroom_is_awaited_between_tasks() -> None:
     for _ in range(4):
         lim.acquire()
     assert lim.headroom_wait(1) == 0.0
-    assert lim.headroom_wait(2) == 60.0                 # the minute holds one more
+    assert lim.headroom_wait(2) == 60.0                 # the minute holds one more ...
+    assert lim.headroom_wait(2, min_span=3600.0) == 0.0  # ... which a task just waits out
     clock.t = 61.0
     assert lim.headroom_wait(2) == 0.0
     assert lim.headroom_wait(3) == 3600.0 - 61.0        # the hour holds two more
