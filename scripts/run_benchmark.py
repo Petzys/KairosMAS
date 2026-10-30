@@ -412,6 +412,7 @@ def main() -> int:
         "google/gemma-3-27b-it": "Gemma",                     # judge-placement matrix (Banking)
         "deepseek/deepseek-v4-flash-0731": "DeepSeek",
         "qwen3.8-27b": "Qwen",                                # Uni Lübeck endpoint (no vendor prefix)
+        "gemma-4-26b-a4b-it": "Gemma",                        # Uni Lübeck endpoint (no vendor prefix)
     }
     if args.agent_name_map == "correct" and args.model in AGENT_NAMES:
         MODEL_NAMES[args.model] = AGENT_NAMES[args.model]
