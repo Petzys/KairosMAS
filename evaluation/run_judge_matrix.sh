@@ -43,6 +43,14 @@
 #   KAIROS_SHARDS 4   KAIROS_JOBS 24   KAIROS_RETRIES 2   KAIROS_API_TIMEOUT 300   KAIROS_API_MAX_RETRIES 4
 #   KAIROS_NAME_MAP correct (default) | legacy
 #
+# Other OpenAI-compatible endpoints (defaults: everything through OpenRouter, as in the paper):
+#   KAIROS_AGENT_BASE_URL   agent endpoint; unset = OpenRouter auto-routing of "vendor/model" ids
+#   KAIROS_AGENT_KEY_ENV    env var holding the agent key (default OPENROUTER_API_KEY)
+#   KAIROS_JUDGE_BASE_URL   judge endpoint (default OpenRouter)
+#   KAIROS_JUDGE_KEY_ENV    env var holding the judge key (default OPENROUTER_API_KEY)
+#   KAIROS_POLICY           policy file (default kairos/config/banking.yaml; the archived cells
+#                           used policies_used/banking_62761659.yaml, identical up to blank lines)
+#
 # Credits: OpenRouter reserves the model's full max_tokens for every request in flight, so
 # with ~24 requests in flight keep roughly $10 of balance above what the run will spend, or
 # it answers 402 before the money is actually used up.
@@ -57,7 +65,11 @@ trap _cleanup TERM INT
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 PY="$REPO/.venv/bin/python"
 LOGS="$REPO/evaluation/logs"; mkdir -p "$LOGS"
-OR="https://openrouter.ai/api/v1"
+OR="${KAIROS_JUDGE_BASE_URL:-https://openrouter.ai/api/v1}"
+JKEY="${KAIROS_JUDGE_KEY_ENV:-OPENROUTER_API_KEY}"
+AGENT_BASE="${KAIROS_AGENT_BASE_URL:-}"
+AKEY="${KAIROS_AGENT_KEY_ENV:-OPENROUTER_API_KEY}"
+POLICY="${KAIROS_POLICY:-kairos/config/banking.yaml}"
 SUITE=banking
 NUT=16                                  # Banking user tasks: user_task_0 .. user_task_15
 NINJ=9                                  # Banking injection tasks per user task
@@ -74,7 +86,7 @@ cd "$REPO" || exit 1
 read -r -a AGENTS <<<"${KAIROS_AGENTS:-qwen/qwen3.5-9b qwen/qwen3.5-27b qwen/qwen3.5-35b-a3b}"
 read -r -a JUDGES <<<"${KAIROS_JUDGES:-qwen/qwen3.5-9b qwen/qwen3.5-27b qwen/qwen3.5-35b-a3b}"
 
-for v in OPENAI_API_KEY OPENROUTER_API_KEY; do
+for v in OPENAI_API_KEY "$JKEY" "$AKEY"; do
     [ -n "${!v:-}" ] || { echo "ERROR: \$$v unset — source .env first" >&2; exit 2; }
 done
 if [ "$GO" = 1 ] && pgrep -f 'run_judge_matrix.sh --go' | grep -qv "^$$\$"; then
@@ -82,7 +94,7 @@ if [ "$GO" = 1 ] && pgrep -f 'run_judge_matrix.sh --go' | grep -qv "^$$\$"; then
 fi
 
 # run_benchmark's cache tag for Banking under this configuration (policy hash included)
-PHASH="$("$PY" -c "import hashlib;print(hashlib.sha1(open('kairos/config/banking.yaml','rb').read()).hexdigest()[:8])")"
+PHASH="$("$PY" -c "import hashlib;print(hashlib.sha1(open('$POLICY','rb').read()).hexdigest()[:8])")"
 ANM=""; [ "$NAME_MAP" = "correct" ] && ANM="-anm"
 tag() {   # tag <kairos|undef> <attack|benign>
     local mode="important_instructions"; [ "$2" = benign ] && mode="noattack"
@@ -151,10 +163,11 @@ unit() {
     e="$(expected "$C" "$K")"
     local ATK=(--attack important_instructions); [ "$C" = benign ] && ATK=(--no-attack)
     local CMD=("$PY" scripts/run_benchmark.py --suite "$SUITE" --model "$M" --agent-name-map "$NAME_MAP"
-               "${ATK[@]}" --logdir "$ROOT" --user-tasks "${TASKS[@]}" "${API[@]}")
+               "${ATK[@]}" --logdir "$ROOT" --user-tasks "${TASKS[@]}" "${API[@]}" --policy "$POLICY")
+    [ -n "$AGENT_BASE" ] && CMD+=(--agent-base-url "$AGENT_BASE" --agent-api-key-env "$AKEY")
     if [ "$J" = "-" ]; then CMD+=(--defense off)
     else CMD+=(--defense on --mode full --speculative on --judge llm --commit auto
-               --judge-model "$J" --judge-base-url "$OR" --judge-api-key-env OPENROUTER_API_KEY); fi
+               --judge-model "$J" --judge-base-url "$OR" --judge-api-key-env "$JKEY"); fi
     LOG="$LOGS/judge_matrix__${NAME}__s${K}of${SHARDS}.log"
     for ((try=0; try<=RETRIES; try++)); do
         quarantine "$CELLDIR" "$C" "${TASKS[@]}" | sed "s|^|=== $(date -Is)  $NAME s$K |"
@@ -167,7 +180,7 @@ unit() {
         "${CMD[@]}" >> "$LOG" 2>&1; rc=$?
         # 402 = account credits; 403 "Key limit exceeded" = the API key's own spending cap
         # (OpenRouter -> Settings -> API Keys). Either way nothing more can run: stop cleanly.
-        if tail -c +"$((off + 1))" "$LOG" | grep -qE 'Error code: 402|Key limit exceeded'; then
+        if tail -c +"$((off + 1))" "$LOG" | grep -qiE 'Error code: 402|Key limit exceeded|budget has been exceeded'; then
             : > "$CREDIT_FLAG"
             echo "=== $(date -Is)  STOP  $NAME s$K: OpenRouter credits or API-key limit exhausted. No further shards start; raise it and re-run."
             return 3
