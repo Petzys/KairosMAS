@@ -1,0 +1,524 @@
+{
+ "$defs": {
+  "AgentCard": {
+   "additionalProperties": false,
+   "description": "Subset of the A2A `AgentCard` known before deployment.",
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "description": {
+     "title": "Description",
+     "type": "string"
+    },
+    "version": {
+     "default": "1.0",
+     "title": "Version",
+     "type": "string"
+    },
+    "capabilities": {
+     "additionalProperties": {
+      "type": "boolean"
+     },
+     "title": "Capabilities",
+     "type": "object"
+    },
+    "default_input_modes": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Default Input Modes",
+     "type": "array"
+    },
+    "default_output_modes": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Default Output Modes",
+     "type": "array"
+    },
+    "skills": {
+     "items": {
+      "$ref": "#/$defs/AgentSkill"
+     },
+     "title": "Skills",
+     "type": "array"
+    }
+   },
+   "required": [
+    "name",
+    "description"
+   ],
+   "title": "AgentCard",
+   "type": "object"
+  },
+  "AgentSkill": {
+   "additionalProperties": false,
+   "description": "A2A `AgentSkill`.",
+   "properties": {
+    "id": {
+     "title": "Id",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "description": {
+     "title": "Description",
+     "type": "string"
+    },
+    "tags": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Tags",
+     "type": "array"
+    },
+    "examples": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Examples",
+     "type": "array"
+    }
+   },
+   "required": [
+    "id",
+    "name",
+    "description"
+   ],
+   "title": "AgentSkill",
+   "type": "object"
+  },
+  "AgentSpec": {
+   "additionalProperties": false,
+   "properties": {
+    "id": {
+     "title": "Id",
+     "type": "string"
+    },
+    "card": {
+     "$ref": "#/$defs/AgentCard"
+    },
+    "system_prompt": {
+     "description": "May use {peers} (rendered cards of reachable agents) and {user} placeholders",
+     "title": "System Prompt",
+     "type": "string"
+    },
+    "tools": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Tools",
+     "type": "array"
+    },
+    "entry": {
+     "default": false,
+     "description": "Receives the principal's prompt",
+     "title": "Entry",
+     "type": "boolean"
+    },
+    "model": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "Model slot; None = the run's default",
+     "title": "Model"
+    }
+   },
+   "required": [
+    "id",
+    "card",
+    "system_prompt"
+   ],
+   "title": "AgentSpec",
+   "type": "object"
+  },
+  "BoardSpec": {
+   "additionalProperties": false,
+   "description": "A shared board (git repo, wiki, ticket system) that agents read and write.",
+   "properties": {
+    "id": {
+     "title": "Id",
+     "type": "string"
+    },
+    "kind": {
+     "enum": [
+      "git",
+      "kv",
+      "document"
+     ],
+     "title": "Kind",
+     "type": "string"
+    },
+    "description": {
+     "default": "",
+     "title": "Description",
+     "type": "string"
+    },
+    "readers": {
+     "anyOf": [
+      {
+       "const": "all",
+       "type": "string"
+      },
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      }
+     ],
+     "default": "all",
+     "title": "Readers"
+    },
+    "writers": {
+     "anyOf": [
+      {
+       "const": "all",
+       "type": "string"
+      },
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      }
+     ],
+     "default": "all",
+     "title": "Writers"
+    },
+    "reversible_writes": {
+     "default": true,
+     "title": "Reversible Writes",
+     "type": "boolean"
+    },
+    "external": {
+     "default": true,
+     "description": "Visible outside the MAS",
+     "title": "External",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "id",
+    "kind"
+   ],
+   "title": "BoardSpec",
+   "type": "object"
+  },
+  "Communication": {
+   "additionalProperties": false,
+   "properties": {
+    "protocol": {
+     "const": "a2a",
+     "default": "a2a",
+     "title": "Protocol",
+     "type": "string"
+    },
+    "modes": {
+     "description": "sync = A2A SendMessage (blocking), async = SendStreamingMessage",
+     "items": {
+      "enum": [
+       "sync",
+       "async"
+      ],
+      "type": "string"
+     },
+     "title": "Modes",
+     "type": "array"
+    },
+    "edges": {
+     "anyOf": [
+      {
+       "const": "complete",
+       "type": "string"
+      },
+      {
+       "items": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "string"
+         }
+        ],
+        "type": "array"
+       },
+       "type": "array"
+      }
+     ],
+     "default": "complete",
+     "description": "Directed (sender, receiver) pairs that may communicate",
+     "title": "Edges"
+    },
+    "session": {
+     "const": "per_agent",
+     "default": "per_agent",
+     "description": "per_agent = each agent keeps one conversation per case; every incoming message is appended to it",
+     "title": "Session",
+     "type": "string"
+    }
+   },
+   "title": "Communication",
+   "type": "object"
+  },
+  "EnvironmentSpec": {
+   "additionalProperties": false,
+   "properties": {
+    "kind": {
+     "enum": [
+      "agentdojo",
+      "python"
+     ],
+     "title": "Kind",
+     "type": "string"
+    },
+    "suite": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Suite"
+    },
+    "version": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Version"
+    },
+    "module": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "python: '<module>:<factory>' returning an environment adapter",
+     "title": "Module"
+    },
+    "initial_state": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "python: state file, relative path",
+     "title": "Initial State"
+    },
+    "injection_vectors": {
+     "additionalProperties": {
+      "type": "string"
+     },
+     "description": "vector id -> where the slot is (tool that returns it)",
+     "title": "Injection Vectors",
+     "type": "object"
+    }
+   },
+   "required": [
+    "kind"
+   ],
+   "title": "EnvironmentSpec",
+   "type": "object"
+  },
+  "Principal": {
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "description": {
+     "default": "",
+     "title": "Description",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "Principal",
+   "type": "object"
+  },
+  "ToolSpec": {
+   "additionalProperties": false,
+   "description": "A tool and its defense-neutral security annotations.\n\nThe annotations are facts about the tool, not about any attack. Defenses derive their\npolicies from them (KAIROS revertable/non-revertable actions and taints, Progent privilege\npolicies, CaMeL capabilities, SafeFlow tool categories).",
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "description": {
+     "default": "",
+     "title": "Description",
+     "type": "string"
+    },
+    "parameters": {
+     "additionalProperties": true,
+     "description": "JSON Schema of the arguments",
+     "title": "Parameters",
+     "type": "object"
+    },
+    "effect": {
+     "description": "Does the call change state?",
+     "enum": [
+      "read",
+      "write"
+     ],
+     "title": "Effect",
+     "type": "string"
+    },
+    "reversible": {
+     "description": "Can the state change be undone (true for every read)?",
+     "title": "Reversible",
+     "type": "boolean"
+    },
+    "external": {
+     "description": "Is the call visible outside the MAS (sends, posts, invites, bookings)?",
+     "title": "External",
+     "type": "boolean"
+    },
+    "impact": {
+     "description": "Harm if called with attacker-chosen arguments: high = money, credentials, data leaving the MAS, membership changes",
+     "enum": [
+      "none",
+      "low",
+      "high"
+     ],
+     "title": "Impact",
+     "type": "string"
+    },
+    "output_trust": {
+     "description": "untrusted = the output can contain third-party (attacker-controllable) content",
+     "enum": [
+      "trusted",
+      "untrusted",
+      "none"
+     ],
+     "title": "Output Trust",
+     "type": "string"
+    },
+    "output_sensitivity": {
+     "description": "Confidentiality of the output",
+     "enum": [
+      "public",
+      "low",
+      "medium",
+      "high"
+     ],
+     "title": "Output Sensitivity",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "effect",
+    "reversible",
+    "external",
+    "impact",
+    "output_trust",
+    "output_sensitivity"
+   ],
+   "title": "ToolSpec",
+   "type": "object"
+  }
+ },
+ "additionalProperties": false,
+ "properties": {
+  "format": {
+   "const": "mascase/0.1",
+   "default": "mascase/0.1",
+   "title": "Format",
+   "type": "string"
+  },
+  "id": {
+   "title": "Id",
+   "type": "string"
+  },
+  "benchmark": {
+   "description": "B1, B2, ...",
+   "title": "Benchmark",
+   "type": "string"
+  },
+  "description": {
+   "default": "",
+   "title": "Description",
+   "type": "string"
+  },
+  "principal": {
+   "$ref": "#/$defs/Principal"
+  },
+  "environment": {
+   "$ref": "#/$defs/EnvironmentSpec"
+  },
+  "tools": {
+   "items": {
+    "$ref": "#/$defs/ToolSpec"
+   },
+   "title": "Tools",
+   "type": "array"
+  },
+  "agents": {
+   "items": {
+    "$ref": "#/$defs/AgentSpec"
+   },
+   "title": "Agents",
+   "type": "array"
+  },
+  "communication": {
+   "$ref": "#/$defs/Communication"
+  },
+  "boards": {
+   "items": {
+    "$ref": "#/$defs/BoardSpec"
+   },
+   "title": "Boards",
+   "type": "array"
+  },
+  "provenance": {
+   "additionalProperties": true,
+   "description": "Where the scenario comes from (paper, table, commit)",
+   "title": "Provenance",
+   "type": "object"
+  }
+ },
+ "required": [
+  "id",
+  "benchmark",
+  "principal",
+  "environment",
+  "tools",
+  "agents"
+ ],
+ "title": "Scenario",
+ "type": "object"
+}

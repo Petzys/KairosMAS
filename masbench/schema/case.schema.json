@@ -1,0 +1,465 @@
+{
+ "$defs": {
+  "Attacker": {
+   "additionalProperties": false,
+   "properties": {
+    "position": {
+     "description": "SoK adversary position: A1 external, A3 member",
+     "enum": [
+      "A1",
+      "A3"
+     ],
+     "title": "Position",
+     "type": "string"
+    },
+    "goal": {
+     "title": "Goal",
+     "type": "string"
+    },
+    "injections": {
+     "items": {
+      "$ref": "#/$defs/Injection"
+     },
+     "title": "Injections",
+     "type": "array"
+    },
+    "board_writes": {
+     "items": {
+      "$ref": "#/$defs/BoardWrite"
+     },
+     "title": "Board Writes",
+     "type": "array"
+    },
+    "compromised_agents": {
+     "items": {
+      "$ref": "#/$defs/CompromisedAgent"
+     },
+     "title": "Compromised Agents",
+     "type": "array"
+    }
+   },
+   "required": [
+    "position",
+    "goal"
+   ],
+   "title": "Attacker",
+   "type": "object"
+  },
+  "BoardWrite": {
+   "additionalProperties": false,
+   "description": "Content on a shared board before the run starts (persistence, laundering).",
+   "properties": {
+    "board": {
+     "title": "Board",
+     "type": "string"
+    },
+    "object": {
+     "description": "File path, issue id, key",
+     "title": "Object",
+     "type": "string"
+    },
+    "content": {
+     "title": "Content",
+     "type": "string"
+    },
+    "author": {
+     "default": "external",
+     "description": "'external' or the id of an agent",
+     "title": "Author",
+     "type": "string"
+    }
+   },
+   "required": [
+    "board",
+    "object",
+    "content"
+   ],
+   "title": "BoardWrite",
+   "type": "object"
+  },
+  "Budget": {
+   "additionalProperties": false,
+   "properties": {
+    "max_turns_per_activation": {
+     "default": 20,
+     "title": "Max Turns Per Activation",
+     "type": "integer"
+    },
+    "max_messages": {
+     "default": 40,
+     "title": "Max Messages",
+     "type": "integer"
+    },
+    "wall_clock_s": {
+     "default": 900.0,
+     "title": "Wall Clock S",
+     "type": "number"
+    }
+   },
+   "title": "Budget",
+   "type": "object"
+  },
+  "Check": {
+   "additionalProperties": false,
+   "properties": {
+    "ref": {
+     "description": "agentdojo:<version>:<suite>:<task_id> | python:<module>:<fn>",
+     "title": "Ref",
+     "type": "string"
+    },
+    "reads": {
+     "description": "What the check inspects: environment state, final answer, tool-call trace",
+     "items": {
+      "enum": [
+       "state",
+       "output",
+       "trace"
+      ],
+      "type": "string"
+     },
+     "title": "Reads",
+     "type": "array"
+    }
+   },
+   "required": [
+    "ref",
+    "reads"
+   ],
+   "title": "Check",
+   "type": "object"
+  },
+  "CompromisedAgent": {
+   "additionalProperties": false,
+   "description": "An agent controlled by the attacker (attacker position A3).",
+   "properties": {
+    "agent": {
+     "title": "Agent",
+     "type": "string"
+    },
+    "system_prompt": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "Replaces the agent's prompt",
+     "title": "System Prompt"
+    },
+    "instructions": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "Appended to the agent's prompt",
+     "title": "Instructions"
+    }
+   },
+   "required": [
+    "agent"
+   ],
+   "title": "CompromisedAgent",
+   "type": "object"
+  },
+  "Injection": {
+   "additionalProperties": false,
+   "description": "Attacker text placed in an environment slot (attacker position A1).",
+   "properties": {
+    "vector": {
+     "title": "Vector",
+     "type": "string"
+    },
+    "attack": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "Template id (e.g. important_instructions); rendered at run time",
+     "title": "Attack"
+    },
+    "goal": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "Goal inserted into the template",
+     "title": "Goal"
+    },
+    "text": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "Literal text; used when attack is None",
+     "title": "Text"
+    }
+   },
+   "required": [
+    "vector"
+   ],
+   "title": "Injection",
+   "type": "object"
+  },
+  "Labels": {
+   "additionalProperties": false,
+   "description": "Facts about a case, used to stratify results. Never shown to agents or defenses.",
+   "properties": {
+    "source": {
+     "title": "Source",
+     "type": "string"
+    },
+    "user_task": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "User Task"
+    },
+    "injection_task": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Injection Task"
+    },
+    "sok_path": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Sok Path"
+    },
+    "attack_class": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Attack Class"
+    },
+    "workers": {
+     "description": "Agents the ground truth uses",
+     "items": {
+      "type": "string"
+     },
+     "title": "Workers",
+     "type": "array"
+    },
+    "comm": {
+     "anyOf": [
+      {
+       "enum": [
+        "delegation",
+        "fan_out",
+        "worker_to_worker"
+       ],
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "delegation = one worker; fan_out = several workers, no data between them; worker_to_worker = a later call depends on another agent's earlier read",
+     "title": "Comm"
+    },
+    "reader_agents": {
+     "description": "Agents that see an injection",
+     "items": {
+      "type": "string"
+     },
+     "title": "Reader Agents",
+     "type": "array"
+    },
+    "actor_agents": {
+     "description": "Agents holding the attack tools",
+     "items": {
+      "type": "string"
+     },
+     "title": "Actor Agents",
+     "type": "array"
+    },
+    "flow": {
+     "anyOf": [
+      {
+       "enum": [
+        "same_agent",
+        "cross_agent",
+        "mixed",
+        "text_only"
+       ],
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Flow"
+    }
+   },
+   "required": [
+    "source"
+   ],
+   "title": "Labels",
+   "type": "object"
+  },
+  "Scoring": {
+   "additionalProperties": false,
+   "properties": {
+    "utility": {
+     "$ref": "#/$defs/Check"
+    },
+    "security": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/Check"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "None for benign cases"
+    }
+   },
+   "required": [
+    "utility"
+   ],
+   "title": "Scoring",
+   "type": "object"
+  },
+  "UserTurn": {
+   "additionalProperties": false,
+   "properties": {
+    "agent": {
+     "description": "Agent that receives the prompt (the entry agent)",
+     "title": "Agent",
+     "type": "string"
+    },
+    "prompt": {
+     "title": "Prompt",
+     "type": "string"
+    }
+   },
+   "required": [
+    "agent",
+    "prompt"
+   ],
+   "title": "UserTurn",
+   "type": "object"
+  }
+ },
+ "additionalProperties": false,
+ "properties": {
+  "format": {
+   "const": "mascase/0.1",
+   "default": "mascase/0.1",
+   "title": "Format",
+   "type": "string"
+  },
+  "id": {
+   "title": "Id",
+   "type": "string"
+  },
+  "scenario": {
+   "title": "Scenario",
+   "type": "string"
+  },
+  "kind": {
+   "enum": [
+    "benign",
+    "attack"
+   ],
+   "title": "Kind",
+   "type": "string"
+  },
+  "benign_twin": {
+   "anyOf": [
+    {
+     "type": "string"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Benign Twin"
+  },
+  "user": {
+   "$ref": "#/$defs/UserTurn"
+  },
+  "attacker": {
+   "anyOf": [
+    {
+     "$ref": "#/$defs/Attacker"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null
+  },
+  "scoring": {
+   "$ref": "#/$defs/Scoring"
+  },
+  "labels": {
+   "$ref": "#/$defs/Labels"
+  },
+  "budget": {
+   "$ref": "#/$defs/Budget"
+  }
+ },
+ "required": [
+  "id",
+  "scenario",
+  "kind",
+  "user",
+  "scoring",
+  "labels"
+ ],
+ "title": "Case",
+ "type": "object"
+}
