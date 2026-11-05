@@ -1,0 +1,399 @@
+"""Run one case: N concurrent agents on a shared environment, talking over an A2A shim.
+
+Semantics (Benchmark Design §2.3, decided 05.11.2026):
+* Every agent is an A2A server and client. `send_message` = A2A SendMessage (blocks until the
+  reply), `send_message_async` = SendStreamingMessage (returns a task id; the reply is put into
+  the sender's conversation when it arrives). `wait_for_replies` blocks on outstanding tasks.
+* Sessions: one conversation per agent per case; every incoming request is appended to it.
+  An agent handles one request at a time; further requests queue.
+* A request is answered by the agent's final text of that activation (the A2A task result).
+* A send that would close a wait-for cycle fails at once instead of deadlocking.
+* The run ends when the entry agent has answered the principal and every agent is idle, or
+  when the case budget (messages, wall clock) is exhausted.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from ast import literal_eval
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any
+
+from agentdojo.agent_pipeline.tool_execution import is_string_list
+
+from masbench.env import Environment
+from masbench.prompts import render_system_prompt
+from masbench.runner.brains import Brain, Turn, TurnCall
+from masbench.runner.defense import Defense, Message, RunContext, ToolCall
+from masbench.schema import (
+    AgentSpec,
+    AgentStats,
+    Case,
+    Interval,
+    Layout,
+    MessageRecord,
+    RunRecord,
+    Scenario,
+    ToolCallRecord,
+)
+
+USER = "user"
+
+
+def a2a_tools(modes: list[str]) -> list[dict[str, Any]]:
+    params = {"type": "object", "required": ["agent_id", "message"], "properties": {
+        "agent_id": {"type": "string", "description": "Id of the agent to contact"},
+        "message": {"type": "string", "description": "The full request, with every detail needed"}}}
+    tools = []
+    if "sync" in modes:
+        tools.append({"type": "function", "function": {
+            "name": "send_message", "parameters": params,
+            "description": "Send a request to another agent and wait for its answer."}})
+    if "async" in modes:
+        tools.append({"type": "function", "function": {
+            "name": "send_message_async", "parameters": params,
+            "description": "Send a request to another agent without waiting. Returns a task id; "
+                           "the answer is delivered to you later."}})
+        tools.append({"type": "function", "function": {
+            "name": "wait_for_replies", "parameters": {"type": "object", "properties": {}},
+            "description": "Wait until all answers to your outstanding requests have arrived."}})
+    return tools
+
+
+A2A_NAMES = {"send_message", "send_message_async", "wait_for_replies"}
+
+
+@dataclass
+class Request:
+    msg: Message
+    reply: asyncio.Future[str] | None
+
+
+class AgentRuntime:
+    def __init__(self, run: MASRun, spec: AgentSpec, brain: Brain, system_prompt: str) -> None:
+        self.run, self.spec, self.id, self.brain = run, spec, spec.id, brain
+        self.inbox: asyncio.Queue[Request] = asyncio.Queue()
+        self.history: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        self.tools = run.env.openai_tools(spec.tools) + a2a_tools(run.scenario.communication.modes)
+        self.seq = 0
+        self.busy = False
+        self.pending: dict[str, asyncio.Task[None]] = {}  # async task id -> waiter
+        self.arrived: list[str] = []
+        self.stats = AgentStats(agent=spec.id, cluster=run.ctx.cluster_of.get(spec.id))
+
+    def next_seq(self) -> int:
+        self.seq += 1
+        return self.seq
+
+    # -- serving ------------------------------------------------------------------------
+
+    async def serve(self) -> None:
+        while True:
+            req = await self.inbox.get()
+            self.busy = True
+            try:
+                try:
+                    text = await self.activate(req.msg)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001 - answer instead of leaving the caller hanging
+                    err = f"{type(e).__name__}: {e}"
+                    self.run.record.error = ((self.run.record.error + " | ") if self.run.record.error else "") + f"{self.id}: {err}"
+                    text = f"(agent `{self.id}` failed: {err})"
+                await self.run.reply(self, req, text)
+            finally:
+                self.busy = False
+                self.inbox.task_done()
+
+    async def activate(self, msg: Message) -> str:
+        self.stats.activations += 1
+        d = self.run.defense
+        text = await d.on_receive(msg, msg.text)
+        self.history.append({"role": "user", "content": text if msg.sender == USER else
+                             f"[Message from agent `{msg.sender}` (task {msg.task_id})]\n{text}"})
+        final = ""
+        reentered = False
+        while True:
+            final = await self._loop()
+            end = await d.on_activation_end(self.id)
+            if end is None:
+                break
+            if end.reenter and not reentered:
+                reentered = True
+                self.history.append({"role": "user", "content": end.notice})
+                continue
+            final = f"{final}\n\n{end.notice}".strip()
+            break
+        return final
+
+    async def _loop(self) -> str:
+        final = ""
+        for _ in range(self.run.case.budget.max_turns_per_activation):
+            self._flush_arrived()
+            for notice in self.run.defense.drain_notices(self.id):
+                self.history.append({"role": "user", "content": notice})
+            async with self.run.interval(self.id, "llm"):
+                turn = await self.brain.step(self.history, self.tools)
+            self.stats.llm_calls += 1
+            self.stats.prompt_tokens += turn.prompt_tokens
+            self.stats.completion_tokens += turn.completion_tokens
+            self.history.append(turn.as_message())
+            if not turn.tool_calls:
+                if self.pending and await self._await_pending():
+                    continue  # give the brain the answers that just arrived
+                final = turn.content or ""
+                break
+            for call in turn.tool_calls:
+                result = await self.dispatch(call)
+                self.history.append({"role": "tool", "tool_call_id": call.id, "content": result})
+        else:
+            final = "(stopped: turn budget of this request exhausted)"
+        return final
+
+    def _flush_arrived(self) -> None:
+        while self.arrived:
+            self.history.append({"role": "user", "content": self.arrived.pop(0)})
+
+    async def _await_pending(self) -> bool:
+        """Wait for outstanding async tasks unless that would deadlock. True if any arrived."""
+        targets = {t.get_name() for t in self.pending.values()}
+        if self.run.would_deadlock(self.id, targets):
+            return False
+        self.run.blocked_on[self.id] = targets
+        try:
+            async with self.run.interval(self.id, "blocked_a2a"):
+                await asyncio.gather(*self.pending.values())
+        finally:
+            self.run.blocked_on.pop(self.id, None)
+        self.pending.clear()
+        return bool(self.arrived)
+
+    # -- tool calls -----------------------------------------------------------------------
+
+    async def dispatch(self, call: TurnCall) -> str:
+        try:
+            args = json.loads(call.arguments or "{}")
+            if not isinstance(args, dict):
+                raise ValueError("arguments must be a JSON object")
+        except ValueError as e:
+            return f"Error: could not parse the arguments: {e}"
+        if call.name in A2A_NAMES:
+            return await self.a2a(call.name, args)
+        for k, v in list(args.items()):  # as AgentDojo's ToolsExecutor: "['a', 'b']" -> list
+            if isinstance(v, str) and is_string_list(v):
+                args[k] = literal_eval(v)
+        return await self.tool(call.name, args)
+
+    async def a2a(self, name: str, args: dict[str, Any]) -> str:
+        if name == "wait_for_replies":
+            if not self.pending:
+                return "Replies: none outstanding." + self._take_arrived()
+            await self._await_pending()
+            return "Replies:" + self._take_arrived()
+        mode = "sync" if name == "send_message" else "async"
+        return await self.run.send(self, str(args.get("agent_id", "")), str(args.get("message", "")), mode)
+
+    def _take_arrived(self) -> str:
+        out = "".join("\n\n" + a for a in self.arrived)
+        self.arrived.clear()
+        return out
+
+    async def tool(self, name: str, args: dict[str, Any]) -> str:
+        run = self.run
+        call = ToolCall(agent=self.id, seq=self.next_seq(), function=name, args=args)
+        t0 = time.monotonic()
+        rec = ToolCallRecord(agent=self.id, seq=call.seq, function=name, args=args, t_start=t0, t_end=t0)
+        run.record.tool_calls.append(rec)
+        if name not in self.spec.tools:
+            rec.error = f"ToolNotFoundError: `{name}` is not one of your tools"
+            rec.t_end = time.monotonic()
+            return f"Error: {rec.error}. Ask the agent responsible for it."
+        async with run.interval(self.id, "defense"):
+            verdict = await run.defense.before_tool(call)
+        if verdict.action == "deny":
+            rec.blocked_by_defense = verdict.reason
+            rec.t_end = time.monotonic()
+            return f"Error: the call was blocked by the security monitor: {verdict.reason}"
+        if verdict.action == "replace":
+            result = verdict.replacement or ""
+            rec.defense_note = verdict.reason or "replaced"
+        else:
+            async with run.interval(self.id, "tool"):
+                out = run.env.run_tool(name, args)
+            run.trace.append((name, args))
+            rec.error = out.error
+            result = out.result if out.error is None else f"Error: {out.error}"
+        result = await run.defense.after_tool(call, result)
+        rec.result, rec.t_end = result, time.monotonic()
+        return result
+
+
+class MASRun:
+    def __init__(self, scenario: Scenario, case: Case, env: Environment, defense: Defense,
+                 brains: dict[str, Brain], layout: Layout | None, model: str) -> None:
+        self.scenario, self.case, self.env, self.defense = scenario, case, env, defense
+        cluster_of = {a: c for c, ms in (layout.clusters.items() if layout else []) for a in ms}
+        self.ctx = RunContext(scenario=scenario, layout=layout, user_prompt=case.user.prompt,
+                              environment=env, cluster_of=cluster_of)
+        self.record = RunRecord(case=case.id, scenario=scenario.id, layout=layout.id if layout else None,
+                                defense=defense.name, model=model)
+        self.trace: list[tuple[str, dict]] = []
+        self.blocked_on: dict[str, set[str]] = {}
+        self.t0 = time.monotonic()
+        self.brains = brains
+        self.agents: dict[str, AgentRuntime] = {}
+        self.ctx.execute_tool = self.execute_committed
+
+    def execute_committed(self, agent: str, function: str, args: dict[str, Any], note: str):  # noqa: ANN201
+        """Run a call a defense held and then committed (event-loop thread only)."""
+        rt = self.agents[agent]
+        t0 = time.monotonic()
+        out = self.env.run_tool(function, args)
+        self.trace.append((function, args))
+        self.record.tool_calls.append(ToolCallRecord(
+            agent=agent, seq=rt.next_seq(), function=function, args=args,
+            result=out.result, error=out.error, defense_note=note, t_start=t0, t_end=time.monotonic()))
+        return out
+
+    @asynccontextmanager
+    async def interval(self, agent: str, kind: str):  # noqa: ANN201
+        start = time.monotonic()
+        try:
+            yield
+        finally:
+            self.record.intervals.append(Interval(agent=agent, kind=kind, t_start=start - self.t0,
+                                                  t_end=time.monotonic() - self.t0))
+
+    def would_deadlock(self, sender: str, targets: set[str]) -> bool:
+        stack, seen = list(targets), set()
+        while stack:
+            a = stack.pop()
+            if a == sender:
+                return True
+            if a not in seen:
+                seen.add(a)
+                stack.extend(self.blocked_on.get(a, ()))
+        return False
+
+    def _msg_record(self, msg: Message) -> MessageRecord:
+        rec = MessageRecord(id=msg.id, task_id=msg.task_id, kind=msg.kind, sender=msg.sender,
+                            receiver=msg.receiver, mode=msg.mode, sender_seq=msg.sender_seq,
+                            text=msg.text, t_sent=time.monotonic() - self.t0)
+        self.record.messages.append(rec)
+        return rec
+
+    async def send(self, sender: AgentRuntime, receiver: str, text: str, mode: str) -> str:
+        if receiver not in self.agents or receiver == sender.id:
+            return f"Error: unknown agent `{receiver}`. Known agents: {', '.join(self.scenario.contacts(sender.id))}"
+        if receiver not in self.scenario.contacts(sender.id):
+            return f"Error: you may not contact `{receiver}`."
+        if sum(m.kind == "request" for m in self.record.messages) >= self.case.budget.max_messages:
+            return "Error: the message budget of this task is exhausted."
+        if mode == "sync" and self.would_deadlock(sender.id, {receiver}):
+            return f"Error: `{receiver}` is waiting for you; answer its request first."
+        msg = Message(id=uuid.uuid4().hex, task_id=uuid.uuid4().hex[:8], kind="request", sender=sender.id,
+                      receiver=receiver, mode=mode, sender_seq=sender.next_seq(), text=text)
+        rec = self._msg_record(msg)
+        async with self.interval(sender.id, "held"):
+            verdict = await self.defense.on_message(msg)
+        if verdict.action == "deny":
+            rec.status, rec.reason = "rejected", verdict.reason
+            return f"Error: the message to `{receiver}` was rejected by the security monitor: {verdict.reason}"
+        if verdict.action == "replace":
+            msg.text = verdict.replacement or ""
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        rec.t_delivered = time.monotonic() - self.t0
+        await self.agents[receiver].inbox.put(Request(msg, fut))
+        if mode == "sync":
+            self.blocked_on[sender.id] = {receiver}
+            try:
+                async with self.interval(sender.id, "blocked_a2a"):
+                    answer = await fut
+            finally:
+                self.blocked_on.pop(sender.id, None)
+            return f"Answer from `{receiver}`:\n{answer}"
+
+        async def waiter() -> None:
+            answer = await fut
+            sender.arrived.append(f"[Answer from agent `{receiver}` to task {msg.task_id}]\n{answer}")
+
+        task = asyncio.create_task(waiter(), name=receiver)
+        sender.pending[msg.task_id] = task
+        return f"Sent to `{receiver}` as task {msg.task_id}. The answer will be delivered to you."
+
+    async def reply(self, agent: AgentRuntime, req: Request, text: str) -> None:
+        if req.msg.sender == USER:
+            verdict = await self.defense.on_final(text)
+            self.record.final_output = text if verdict.action == "allow" else (
+                verdict.replacement or f"(final answer withheld by the security monitor: {verdict.reason})")
+            if req.reply and not req.reply.done():
+                req.reply.set_result(self.record.final_output)
+            return
+        msg = Message(id=uuid.uuid4().hex, task_id=req.msg.task_id, kind="reply", sender=agent.id,
+                      receiver=req.msg.sender, mode=req.msg.mode, sender_seq=agent.next_seq(), text=text)
+        rec = self._msg_record(msg)
+        async with self.interval(agent.id, "held"):
+            verdict = await self.defense.on_message(msg)
+        if verdict.action == "deny":
+            rec.status, rec.reason = "rejected", verdict.reason
+            answer = f"(the answer of `{agent.id}` was rejected by the security monitor: {verdict.reason})"
+        else:
+            if verdict.action == "replace":
+                msg.text = verdict.replacement or ""
+            answer = await self.defense.on_receive(msg, msg.text)
+        rec.t_delivered = time.monotonic() - self.t0
+        if req.reply and not req.reply.done():
+            req.reply.set_result(answer)
+
+    async def _run(self) -> None:
+        await self.defense.setup(self.ctx)
+        for spec in self.scenario.agents:
+            prompt = self.defense.system_prompt(spec, render_system_prompt(self.scenario, spec))
+            brain = self.defense.make_brain(spec, self.brains[spec.id])
+            self.agents[spec.id] = AgentRuntime(self, spec, brain, prompt)
+        servers = [asyncio.create_task(a.serve(), name=f"serve:{a.id}") for a in self.agents.values()]
+        try:
+            entry = self.agents[self.case.user.agent]
+            fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+            first = Message(id=uuid.uuid4().hex, task_id="user", kind="request", sender=USER,
+                            receiver=entry.id, mode="sync", sender_seq=0, text=self.case.user.prompt)
+            await entry.inbox.put(Request(first, fut))
+            await fut
+            # quiescence: let agents finish work still running after the answer
+            while any(a.busy or not a.inbox.empty() for a in self.agents.values()):
+                await asyncio.sleep(0.05)
+            await self.defense.finish()
+        finally:
+            for s in servers:
+                s.cancel()
+            for a in self.agents.values():
+                for t in a.pending.values():
+                    t.cancel()
+
+    async def execute(self) -> RunRecord:
+        self.record.t_start = time.time()
+        try:
+            await asyncio.wait_for(self._run(), timeout=self.case.budget.wall_clock_s)
+        except TimeoutError:
+            self.record.error = "timeout"
+        except Exception as e:  # noqa: BLE001 - the record keeps the error, the batch goes on
+            self.record.error = f"{type(e).__name__}: {e}"
+        self.record.t_end = time.time()
+        out = self.record.final_output or ""
+        try:
+            self.record.utility = self.env.score(self.case.scoring.utility, out, self.trace)
+            if self.case.scoring.security is not None:
+                self.record.security = self.env.score(self.case.scoring.security, out, self.trace)
+        except Exception as e:  # noqa: BLE001
+            self.record.error = (self.record.error or "") + f" | scoring: {type(e).__name__}: {e}"
+        for a in self.agents.values():
+            a.stats.transcript = a.history
+            self.record.agents.append(a.stats)
+        self.record.defense_log = self.ctx.log
+        return self.record
+
+
+__all__ = ["MASRun", "Turn"]
