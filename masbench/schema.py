@@ -1,15 +1,15 @@
 """The `mascase/0.1` file format.
 
-Four files describe a benchmark scenario. Only the policy files are specific to one defense:
+Two files describe a benchmark scenario; nothing in them is specific to a defense:
 
 * `scenario.yaml`  -> `Scenario`: the world (environment, tools with defense-neutral security
   annotations, agents with A2A agent cards, who may talk to whom, shared boards).
 * `cases.jsonl`    -> `Case`, one per line: the principal's prompt, the attacker, the scoring
   checks and labels used to stratify results.
-* `layouts.yaml`   -> `LayoutSet`: partitions of the agents into clusters.
-* `policies/<defense>/...`: whatever the defense needs; generated from the annotations here.
 
-A run produces one `RunRecord` per (case, layout, defense, model).
+Defense configuration (policies, cluster layouts, detectors, ...) lives with each defense's
+adapter, outside this package, and is derived from the annotations here. A run produces one
+`RunRecord` per (case, defense + options, model).
 
 Conventions
 -----------
@@ -40,8 +40,9 @@ class ToolSpec(_Model):
     """A tool and its defense-neutral security annotations.
 
     The annotations are facts about the tool, not about any attack. Defenses derive their
-    policies from them (KAIROS revertable/non-revertable actions and taints, Progent privilege
-    policies, CaMeL capabilities, SafeFlow tool categories).
+    policies from them (e.g. revertable/non-revertable actions and sensitivity labels for an
+    information-flow monitor, Progent privilege policies, CaMeL capabilities, SafeFlow tool
+    categories, which messages a message-level detector should watch).
     """
 
     name: str
@@ -314,34 +315,6 @@ class Case(_Model):
         return self
 
 
-# --------------------------------------------------------------------------- layouts
-
-
-class Layout(_Model):
-    id: str
-    strategy: Literal["single", "func", "crit", "one", "org", "sweep"]
-    description: str = ""
-    clusters: dict[str, list[str]]
-
-
-class LayoutSet(_Model):
-    format: Literal["mascase/0.1"] = FORMAT
-    scenario: str
-    agents: list[str]
-    layouts: list[Layout]
-
-    @model_validator(mode="after")
-    def _partitions(self) -> LayoutSet:
-        for lay in self.layouts:
-            members = [a for ms in lay.clusters.values() for a in ms]
-            if sorted(members) != sorted(self.agents):
-                raise ValueError(f"layout {lay.id} is not a partition of the agents")
-        return self
-
-    def get(self, layout_id: str) -> Layout:
-        return next(lay for lay in self.layouts if lay.id == layout_id)
-
-
 # --------------------------------------------------------------------------- run records
 
 
@@ -383,7 +356,6 @@ class Interval(_Model):
 
 class AgentStats(_Model):
     agent: str
-    cluster: str | None = None
     activations: int = 0
     llm_calls: int = 0
     prompt_tokens: int = 0
@@ -395,8 +367,8 @@ class RunRecord(_Model):
     format: Literal["mascase/0.1"] = FORMAT
     case: str
     scenario: str
-    layout: str | None
     defense: str
+    defense_options: dict[str, Any] = Field(default_factory=dict)
     model: str
     utility: bool | None = None
     security: bool | None = Field(default=None, description="True = attacker goal met")
@@ -414,6 +386,5 @@ class RunRecord(_Model):
 SCHEMAS: dict[str, type[BaseModel]] = {
     "scenario": Scenario,
     "case": Case,
-    "layouts": LayoutSet,
     "run_record": RunRecord,
 }

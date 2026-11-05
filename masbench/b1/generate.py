@@ -2,7 +2,7 @@
 
     .venv/bin/python -m masbench.b1.generate [--version v1]
 
-Writes data/b1/<suite>/{scenario.yaml, cases.jsonl, layouts.yaml}. Everything is derived from
+Writes data/b1/<suite>/{scenario.yaml, cases.jsonl}. Everything is derived from
 AgentDojo and `partition.py`; the labels come from running each task's ground truth with a
 canary string in every injection slot (as AgentDojo's `get_injection_candidates` does).
 """
@@ -30,7 +30,6 @@ from masbench.b1.partition import (
     TABLE_COUNTS,
     SubAgent,
 )
-from masbench.layouts import build_layouts
 from masbench.schema import (
     AgentCard,
     AgentSkill,
@@ -211,7 +210,6 @@ def generate(suite_name: str, version: str = "v1") -> tuple[Scenario, list[Case]
     cases = build_cases(suite_name, version, s, carriers_by_task)
     io.write_scenario(s, HEADER)
     io.write_cases(s.id, cases)
-    io.write_layouts(build_layouts(s), HEADER)
     return s, cases
 
 

@@ -3,7 +3,8 @@
 The runner calls these hooks at every point where something crosses an agent boundary. All
 hooks are async: a defense may stall a call (hold an effect, wait for an oracle) simply by
 awaiting. The defense never sees the case's attacker, scoring or labels, only what a deployed
-monitor would see: the scenario, the principal's prompt, the cluster layout and the traffic.
+monitor would see: the scenario, the principal's prompt and the traffic. Defense-specific
+configuration (policies, cluster layouts, thresholds) comes in through the defense's own options.
 
 Where existing defenses attach:
 
@@ -14,7 +15,7 @@ Where existing defenses attach:
 | CaMeL / multi-CaMeL | make_brain (replaces the agent's LLM loop) |
 | SafeFlow | before_tool (staged hard sinks), after_tool / on_receive (taint) |
 | BlindGuard | on_message (graph of messages) |
-| KAIROS (per agent), KAIROS MAS | before_tool, after_tool, on_message, on_receive, on_activation_end, drain_notices, ctx.execute_tool |
+| Staging monitors (KAIROS, KAIROS MAS) | before_tool (hold with a stub), on_message, on_receive, on_activation_end, drain_notices, ctx.execute_tool (commit) |
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from masbench.env import Environment
     from masbench.runner.brains import Brain
-    from masbench.schema import AgentSpec, Layout, Scenario
+    from masbench.schema import AgentSpec, Scenario
 
 
 @dataclass
@@ -80,10 +81,8 @@ class EndAction:
 @dataclass
 class RunContext:
     scenario: Scenario
-    layout: Layout | None
     user_prompt: str
     environment: Environment
-    cluster_of: dict[str, str] = field(default_factory=dict)
     log: list[dict[str, Any]] = field(default_factory=list)  # goes to RunRecord.defense_log
     # execute_tool(agent, function, args, note) -> ToolOutcome: runs a call the defense
     # held and later committed. Must be called on the event-loop thread; it records the
@@ -123,11 +122,11 @@ class Defense:
         return text
 
     async def on_activation_end(self, agent: str) -> EndAction | None:
-        """The agent finished handling one request (a KAIROS resolution trigger)."""
+        """The agent finished handling one request (e.g. a trigger to resolve held effects)."""
         return None
 
     def drain_notices(self, agent: str) -> list[str]:
-        """Notices for the agent (e.g. KAIROS abort notices); the runner appends them as
+        """Notices for the agent (e.g. that held actions were withheld); the runner appends them as
         user messages before the agent's next LLM call."""
         return []
 
@@ -139,22 +138,24 @@ class Defense:
         """End of run; flush pending decisions into ctx.log."""
 
 
-REGISTRY: dict[str, type[Defense] | str] = {
-    "undefended": Defense,
-    "kairos-per-agent": "masbench.defenses.kairos_per_agent:KairosPerAgent",
-}
+REGISTRY: dict[str, type[Defense]] = {"undefended": Defense}
+ENTRY_POINT_GROUP = "masbench.defenses"
 
 
 def load_defense(name: str, **options: Any) -> Defense:
-    """`undefended` or `<module>:<Class>`."""
+    """A name in REGISTRY, a name registered under the `masbench.defenses` entry-point group
+    (e.g. `[project.entry-points."masbench.defenses"] my-defense = "pkg.mod:Class"`), or
+    `<module>:<Class>`."""
     import importlib
+    from importlib.metadata import entry_points
 
     if name in REGISTRY:
-        cls = REGISTRY[name]
-        if isinstance(cls, str):
-            mod, _, attr = cls.partition(":")
-            cls = getattr(importlib.import_module(mod), attr)
-        return cls(**options)
-
-    module, _, cls = name.partition(":")
+        return REGISTRY[name](**options)
+    for ep in entry_points(group=ENTRY_POINT_GROUP):
+        if ep.name == name:
+            return ep.load()(**options)
+    module, sep, cls = name.partition(":")
+    if not sep:
+        known = sorted({*REGISTRY, *(ep.name for ep in entry_points(group=ENTRY_POINT_GROUP))})
+        raise ValueError(f"unknown defense {name!r}; known: {known}, or give <module>:<Class>")
     return getattr(importlib.import_module(module), cls)(**options)

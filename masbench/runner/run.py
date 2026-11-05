@@ -1,6 +1,6 @@
 """Run cases and store one `RunRecord` per case.
 
-Records go to `<out>/<defense>/<model>/<layout>/<scenario>/<case id with / -> __>.json`; an
+Records go to `<out>/<defense+options>/<model>/<scenario>/<case id with / -> __>.json`; an
 existing record is skipped, so interrupted batches resume.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ from masbench.env import make_environment
 from masbench.runner.brains import Brain, LLMBrain, ReplayOrchestrator, ReplayWorker
 from masbench.runner.defense import load_defense
 from masbench.runner.mas import MASRun
-from masbench.schema import Case, Layout, RunRecord, Scenario
+from masbench.schema import Case, RunRecord, Scenario
 
 
 @dataclass
@@ -48,18 +48,18 @@ def _brains(scenario: Scenario, case: Case, env, cfg: RunConfig) -> dict[str, Br
     return brains
 
 
-async def run_case(scenario: Scenario, case: Case, layout: Layout | None, cfg: RunConfig) -> RunRecord:
+async def run_case(scenario: Scenario, case: Case, cfg: RunConfig) -> RunRecord:
     name = model_display_name(cfg.model, cfg.injection_model_name)
     injections = render_injections(case, user=scenario.principal.name, model_name=name,
                                    attack_override=cfg.attack)
     env = make_environment(scenario, case, injections)
     defense = load_defense(cfg.defense, **cfg.defense_options)
     model = cfg.model if cfg.brain == "llm" else cfg.brain
-    run = MASRun(scenario, case, env, defense, _brains(scenario, case, env, cfg), layout, model)
+    run = MASRun(scenario, case, env, defense, _brains(scenario, case, env, cfg), model)
     return await run.execute()
 
 
-def record_path(out: Path, cfg: RunConfig, layout: Layout | None, case: Case) -> Path:
+def record_path(out: Path, cfg: RunConfig, case: Case) -> Path:
     model = (cfg.model if cfg.brain == "llm" else cfg.brain).replace("/", "_")
     tag = cfg.defense.replace(":", "_").replace(".", "_")
     for k, v in sorted(cfg.defense_options.items()):
@@ -67,22 +67,22 @@ def record_path(out: Path, cfg: RunConfig, layout: Layout | None, case: Case) ->
             tag += f"-{k}={v}".replace("/", "_")
     if cfg.attack:
         tag += f"-{cfg.attack}"
-    return (out / tag / model / (layout.id if layout else "none") / case.scenario
+    return (out / tag / model / case.scenario
             / (case.id.split("/", 1)[1].replace("/", "__") + ".json"))
 
 
-async def run_batch(scenario: Scenario, cases: list[Case], layout: Layout | None, cfg: RunConfig,
+async def run_batch(scenario: Scenario, cases: list[Case], cfg: RunConfig,
                     out: Path | None, concurrency: int = 4, progress: bool = True) -> list[RunRecord]:
     sem = asyncio.Semaphore(concurrency)
     records: list[RunRecord] = []
 
     async def one(case: Case) -> None:
-        path = record_path(out, cfg, layout, case) if out else None
+        path = record_path(out, cfg, case) if out else None
         if path and path.exists():
             records.append(RunRecord.model_validate_json(path.read_text()))
             return
         async with sem:
-            rec = await run_case(scenario, case, layout, cfg)
+            rec = await run_case(scenario, case, cfg)
         records.append(rec)
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)

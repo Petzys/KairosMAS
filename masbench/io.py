@@ -1,4 +1,4 @@
-"""Read and write scenario directories (`scenario.yaml`, `cases.jsonl`, `layouts.yaml`)."""
+"""Read and write scenario directories (`scenario.yaml`, `cases.jsonl`)."""
 from __future__ import annotations
 
 import json
@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from masbench.schema import Case, LayoutSet, Scenario
+from masbench.schema import Case, Scenario
 
 DATA = Path(__file__).parent / "data"
 
@@ -50,10 +50,6 @@ def load_scenario(scenario_id: str) -> Scenario:
     return Scenario.model_validate(load_yaml(scenario_dir(scenario_id) / "scenario.yaml"))
 
 
-def load_layouts(scenario_id: str) -> LayoutSet:
-    return LayoutSet.model_validate(load_yaml(scenario_dir(scenario_id) / "layouts.yaml"))
-
-
 def load_cases(scenario_id: str) -> list[Case]:
     path = scenario_dir(scenario_id) / "cases.jsonl"
     return [Case.model_validate_json(line) for line in path.read_text().splitlines() if line.strip()]
@@ -61,10 +57,6 @@ def load_cases(scenario_id: str) -> list[Case]:
 
 def write_scenario(s: Scenario, header: str = "") -> None:
     dump_yaml(s.model_dump(mode="json", exclude_defaults=False), scenario_dir(s.id) / "scenario.yaml", header)
-
-
-def write_layouts(ls: LayoutSet, header: str = "") -> None:
-    dump_yaml(ls.model_dump(mode="json"), scenario_dir(ls.scenario) / "layouts.yaml", header)
 
 
 def write_cases(scenario_id: str, cases: Iterable[Case]) -> None:

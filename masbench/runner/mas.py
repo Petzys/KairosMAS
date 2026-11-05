@@ -33,7 +33,6 @@ from masbench.schema import (
     AgentStats,
     Case,
     Interval,
-    Layout,
     MessageRecord,
     RunRecord,
     Scenario,
@@ -82,7 +81,7 @@ class AgentRuntime:
         self.busy = False
         self.pending: dict[str, asyncio.Task[None]] = {}  # async task id -> waiter
         self.arrived: list[str] = []
-        self.stats = AgentStats(agent=spec.id, cluster=run.ctx.cluster_of.get(spec.id))
+        self.stats = AgentStats(agent=spec.id)
 
     def next_seq(self) -> int:
         self.seq += 1
@@ -233,13 +232,11 @@ class AgentRuntime:
 
 class MASRun:
     def __init__(self, scenario: Scenario, case: Case, env: Environment, defense: Defense,
-                 brains: dict[str, Brain], layout: Layout | None, model: str) -> None:
+                 brains: dict[str, Brain], model: str) -> None:
         self.scenario, self.case, self.env, self.defense = scenario, case, env, defense
-        cluster_of = {a: c for c, ms in (layout.clusters.items() if layout else []) for a in ms}
-        self.ctx = RunContext(scenario=scenario, layout=layout, user_prompt=case.user.prompt,
-                              environment=env, cluster_of=cluster_of)
-        self.record = RunRecord(case=case.id, scenario=scenario.id, layout=layout.id if layout else None,
-                                defense=defense.name, model=model)
+        self.ctx = RunContext(scenario=scenario, user_prompt=case.user.prompt, environment=env)
+        self.record = RunRecord(case=case.id, scenario=scenario.id, defense=defense.name,
+                                defense_options=dict(defense.options), model=model)
         self.trace: list[tuple[str, dict]] = []
         self.blocked_on: dict[str, set[str]] = {}
         self.t0 = time.monotonic()
