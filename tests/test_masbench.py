@@ -173,3 +173,19 @@ def test_written_policies_are_current(suite: str) -> None:
     for a in s.agents:
         assert yaml.safe_load((base / "agents" / f"{a.id}.yaml").read_text()) == \
             kairos_mas.agent_policy(s, a.id, raw, source), "run `masbench.cli policies`"
+
+
+def test_kairos_per_agent_peer_trust_dilemma() -> None:
+    """Replayed attack: relayed IBAN launders through trusted peers, is held when untrusted."""
+    s = io.load_scenario("b1.banking")
+    case = next(c for c in io.load_cases(s.id) if c.id == "b1.banking/user_task_0/injection_task_0")
+    out = {}
+    for trust in ("trusted", "untrusted"):
+        cfg = RunConfig(brain="replay-attack", defense="kairos-per-agent",
+                        defense_options={"judge_model": "deterministic", "peer_trust": trust})
+        rec = asyncio.run(run_batch(s, [case], None, cfg, None, progress=False))[0]
+        assert rec.error is None, rec.error
+        out[trust] = rec
+    assert out["trusted"].security is True
+    assert out["untrusted"].security is False
+    assert any(t.defense_note == "held" and t.function == "send_money" for t in out["untrusted"].tool_calls)

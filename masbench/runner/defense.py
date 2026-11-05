@@ -141,6 +141,7 @@ class Defense:
 
 REGISTRY: dict[str, type[Defense] | str] = {
     "undefended": Defense,
+    "kairos-per-agent": "masbench.defenses.kairos_per_agent:KairosPerAgent",
 }
 
 
