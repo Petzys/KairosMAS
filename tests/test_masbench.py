@@ -5,12 +5,14 @@ import asyncio
 import json
 
 import pytest
+import yaml
 
 from masbench import io
 from masbench.attacks import render_injections
 from masbench.b1.partition import SUITES, TABLE_COUNTS
 from masbench.env import make_environment
 from masbench.layouts import set_partitions
+from masbench.policies import kairos_mas
 from masbench.runner.brains import ReplayWorker, Turn, _call
 from masbench.runner.defense import REGISTRY, Defense, Verdict
 from masbench.runner.mas import MASRun
@@ -134,3 +136,40 @@ def test_sync_cycle_fails_fast_instead_of_deadlocking() -> None:
     rec = asyncio.run(MASRun(s, case, env, Defense(), brains, None, "test").execute())
     assert rec.error is None
     assert "waiting for you" in rec.final_output
+
+
+def test_kairos_mas_policies_compose_back_to_suite_policy(suite: str) -> None:
+    from kairos.policy.parser import parse_policy
+
+    s = io.load_scenario(f"b1.{suite}")
+    raw, source = kairos_mas.suite_policy(suite)
+    agents = {a.id: kairos_mas.agent_policy(s, a.id, raw, source) for a in s.agents}
+    tmpl = kairos_mas.cluster_template(s, raw, source)
+    layouts = io.load_layouts(s.id)
+
+    one = layouts.get("L-one")
+    composed = kairos_mas.compose(list(agents.values()), kairos_mas.cluster_policy(s, one, "all", tmpl), suite)
+    a, b = parse_policy(composed), parse_policy(raw)
+    assert sorted(a.context.revertable) == sorted(b.context.revertable)
+    assert sorted(a.context.non_revertable) == sorted(b.context.non_revertable)
+    assert a.context.default_action == b.context.default_action
+    assert a.context.navigational_get == b.context.navigational_get
+    assert a.context.embedded_identifiers == b.context.embedded_identifiers
+    assert sorted(t.name for t in a.resources.taints) == sorted(t.name for t in b.resources.taints)
+    assert a.resources.contact_book == b.resources.contact_book
+    assert a.rules == b.rules
+
+    for lay in layouts.layouts:  # every partition, including the sweep, yields valid policies
+        for c, members in lay.clusters.items():
+            pol = kairos_mas.cluster_policy(s, lay, c, tmpl)
+            parse_policy(kairos_mas.compose([agents[m] for m in members], pol, f"{suite}:{c}"))
+            assert set(pol["contact_book"]["clusters"]) == set(lay.clusters) - {c}
+
+
+def test_written_policies_are_current(suite: str) -> None:
+    s = io.load_scenario(f"b1.{suite}")
+    raw, source = kairos_mas.suite_policy(suite)
+    base = kairos_mas.OUT / "b1" / suite
+    for a in s.agents:
+        assert yaml.safe_load((base / "agents" / f"{a.id}.yaml").read_text()) == \
+            kairos_mas.agent_policy(s, a.id, raw, source), "run `masbench.cli policies`"
