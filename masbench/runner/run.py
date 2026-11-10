@@ -75,7 +75,8 @@ async def run_case(scenario: Scenario, case: Case, cfg: RunConfig, repetition: i
                          defense_options=dict(defense.options), model=model, variant=case.variant,
                          repetition=repetition, not_applicable=reason,
                          labels=case.labels.model_dump(mode="json", exclude_defaults=True))
-    name = model_display_name(cfg.model, cfg.injection_model_name)
+    templated = case.attacker is not None and any(i.attack for i in case.attacker.injections)
+    name = model_display_name(cfg.model, cfg.injection_model_name) if templated else "AI assistant"
     injections = render_injections(case, user=scenario.principal.name, model_name=name,
                                    attack_override=cfg.attack)
     env = make_environment(scenario, case, injections)

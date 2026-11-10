@@ -393,6 +393,9 @@ class MASRun:
                 return f"Error: the message to `{receiver}` was rejected by the security monitor: {rec.reason}"
         async with self.interval(sender.id, "held"):
             verdict = await self.defense.on_message(msg)
+        for a in (sender.id, receiver):  # isolated while looking at this very message
+            if a in self.record.isolated and verdict.action == "allow":
+                verdict = Verdict.deny(f"`{a}` is isolated: {self.record.isolated[a]}")
         if verdict.action in ("deny", "abort"):
             rec.status, rec.reason = "rejected", verdict.reason
         self.note(verdict, "on_message", sender.id, receiver)
@@ -439,6 +442,8 @@ class MASRun:
             else:
                 async with self.interval(agent.id, "held"):
                     verdict = await self.defense.on_message(msg)
+                if agent.id in self.record.isolated and verdict.action == "allow":
+                    verdict = Verdict.deny(f"`{agent.id}` is isolated: {self.record.isolated[agent.id]}")
                 if verdict.action in ("deny", "abort"):
                     rec.status, rec.reason = "rejected", verdict.reason
                 self.note(verdict, "on_message", agent.id, msg.receiver)
