@@ -113,22 +113,27 @@ class ScriptedBrain:
     The script holds one action list per activation (= per request the agent receives).
     Actions: `{"tool": name, "args": {...}}`, `{"send": agent, "text": ...}` (synchronous),
     `{"reply": text}` (ends the activation; default reply is the last tool result). In every
-    string, `{last}` stands for the agent's latest tool result or peer answer and `{request}`
-    for the request being handled, so content really flows through tools, messages and
-    boards instead of being restated by the script."""
+    string, `{last}` stands for the agent's latest tool result or peer answer, `{request}`
+    for the request being handled, and `{name}` for the result of an earlier action marked
+    `"as": name`, so content really flows through tools, messages and boards instead of
+    being restated by the script."""
 
     def __init__(self, activations: list[list[dict[str, Any]]]) -> None:
         self.activations = [list(a) for a in activations]
         self.current: list[dict[str, Any]] | None = None
+        self.vars: dict[str, str] = {}
+        self.capture: str | None = None
 
-    @staticmethod
-    def _fill(obj: Any, last: str, request: str) -> Any:
+    def _fill(self, obj: Any, last: str, request: str) -> Any:
         if isinstance(obj, str):
-            return obj.replace("{last}", last).replace("{request}", request)
+            obj = obj.replace("{last}", last).replace("{request}", request)
+            for k, v in self.vars.items():
+                obj = obj.replace("{" + k + "}", v)
+            return obj
         if isinstance(obj, dict):
-            return {k: ScriptedBrain._fill(v, last, request) for k, v in obj.items()}
+            return {k: self._fill(v, last, request) for k, v in obj.items()}
         if isinstance(obj, list):
-            return [ScriptedBrain._fill(v, last, request) for v in obj]
+            return [self._fill(v, last, request) for v in obj]
         return obj
 
     async def step(self, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Turn:
@@ -137,12 +142,15 @@ class ScriptedBrain:
         request = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
         if request.startswith("[Message from agent") and "\n" in request:
             request = request.split("\n", 1)[1]
+        if self.capture:
+            self.vars[self.capture], self.capture = last, None
         if self.current is None:
             self.current = self.activations.pop(0) if self.activations else []
         if not self.current:
             self.current = None
             return Turn(last or "Done.")
         action = self._fill(self.current.pop(0), last, request)
+        self.capture = action.get("as")
         if "reply" in action:
             self.current = None
             return Turn(action["reply"])

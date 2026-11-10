@@ -261,7 +261,7 @@ def _shell_line(env: SimEnvironment, agent: str, line: str, files: dict[str, str
         for i, a in enumerate(argv[:-1]):
             if a in ("-d", "--data", "--data-binary", "--data-raw", "-F", "--form", "--post-data", "-T"):
                 v = argv[i + 1]
-                v = v.split("=@", 1)[1] if "=@" in v else v
+                v = "@" + v.split("=@", 1)[1] if "=@" in v else v
                 data.append(_file(files, v[1:]) if v.startswith("@") else _expand(v, files, environ))
                 method = "POST"
             if a in ("-X", "--request"):
