@@ -7,7 +7,7 @@ task needs inter-agent communication. **B2** (MAS-unique attacks) uses the same 
 masbench knows no defense. Scenarios carry defense-neutral tool annotations (effect,
 reversibility, external reach, impact, output trust, sensitivity); each defense derives its own
 configuration from them in an adapter that lives with the defense and subclasses
-`runner/defense.py:Defense`. The KAIROS adapter is `kairos/adapters/masbench/`.
+`runner/defense.py:Defense`. The KAIROS adapter is `masbench/defenses/kairos/`.
 
 | Path | What it is |
 |---|---|

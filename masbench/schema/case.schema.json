@@ -4,10 +4,11 @@
    "additionalProperties": false,
    "properties": {
     "position": {
-     "description": "SoK adversary position: A1 external, A3 member",
+     "description": "SoK adversary position: A1 external content, A3 member agent(s), or both",
      "enum": [
       "A1",
-      "A3"
+      "A3",
+      "A1+A3"
      ],
      "title": "Position",
      "type": "string"
@@ -108,7 +109,7 @@
      "type": "string"
     },
     "reads": {
-     "description": "What the check inspects: environment state, final answer, tool-call trace",
+     "description": "What the check inspects: environment state (incl. the sink log), final answer, tool-call and message trace",
      "items": {
       "enum": [
        "state",
@@ -119,6 +120,12 @@
      },
      "title": "Reads",
      "type": "array"
+    },
+    "args": {
+     "additionalProperties": true,
+     "description": "python checks: keyword arguments",
+     "title": "Args",
+     "type": "object"
     }
    },
    "required": [
@@ -230,6 +237,179 @@
     "source": {
      "title": "Source",
      "type": "string"
+    },
+    "core_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "B2: stable id in b2_core.csv (B2-07)",
+     "title": "Core Id"
+    },
+    "case_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "B2: id in the attack catalogue",
+     "title": "Case Id"
+    },
+    "primary_class": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Primary Class"
+    },
+    "origin": {
+     "anyOf": [
+      {
+       "enum": [
+        "as-is",
+        "adapted",
+        "synthetic"
+       ],
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Origin"
+    },
+    "adversary": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Adversary"
+    },
+    "sok_paths": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Sok Paths",
+     "type": "array"
+    },
+    "sok_risks": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Sok Risks",
+     "type": "array"
+    },
+    "delivery": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Delivery"
+    },
+    "shared_board": {
+     "anyOf": [
+      {
+       "enum": [
+        "yes",
+        "no",
+        "variant"
+       ],
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Shared Board"
+    },
+    "attack_path": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "Agent/board chain the attack must cross",
+     "title": "Attack Path"
+    },
+    "path_agents": {
+     "description": "Agent and board ids on attack_path, in order (path check)",
+     "items": {
+      "type": "string"
+     },
+     "title": "Path Agents",
+     "type": "array"
+    },
+    "payload_source": {
+     "anyOf": [
+      {
+       "enum": [
+        "verbatim",
+        "written"
+       ],
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "verbatim = copied from the seed; written = made for this benchmark",
+     "title": "Payload Source"
+    },
+    "seed": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "Repo + commit or paper the case comes from",
+     "title": "Seed"
+    },
+    "impl_note": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Impl Note"
     },
     "user_task": {
      "anyOf": [
@@ -395,8 +575,8 @@
  "additionalProperties": false,
  "properties": {
   "format": {
-   "const": "mascase/0.1",
-   "default": "mascase/0.1",
+   "const": "mascase/0.2",
+   "default": "mascase/0.2",
    "title": "Format",
    "type": "string"
   },
@@ -409,9 +589,11 @@
    "type": "string"
   },
   "kind": {
+   "description": "control = an attack case with one fragment removed; its security check must stay False",
    "enum": [
     "benign",
-    "attack"
+    "attack",
+    "control"
    ],
    "title": "Kind",
    "type": "string"
@@ -427,6 +609,25 @@
    ],
    "default": null,
    "title": "Benign Twin"
+  },
+  "control_of": {
+   "anyOf": [
+    {
+     "type": "string"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "description": "control: id of the attack case",
+   "title": "Control Of"
+  },
+  "setup": {
+   "additionalProperties": true,
+   "description": "Case-specific parameters of the environment's initial state",
+   "title": "Setup",
+   "type": "object"
   },
   "user": {
    "$ref": "#/$defs/UserTurn"
@@ -450,6 +651,29 @@
   },
   "budget": {
    "$ref": "#/$defs/Budget"
+  },
+  "script": {
+   "anyOf": [
+    {
+     "additionalProperties": {
+      "items": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "type": "array"
+      },
+      "type": "array"
+     },
+     "type": "object"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "description": "Ground truth for `--brain replay`: per agent, one action list per activation. Actions: {tool, args} | {send, text} | {reply}. Attack cases script the attack, benign cases the task. Never shown to agents or defenses.",
+   "title": "Script"
   }
  },
  "required": [

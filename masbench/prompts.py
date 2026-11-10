@@ -53,6 +53,10 @@ def render_peers(scenario: Scenario, agent_id: str) -> str:
 
 
 def render_system_prompt(scenario: Scenario, agent: AgentSpec) -> str:
-    return agent.system_prompt.format(
-        peers=render_peers(scenario, agent.id), user=scenario.principal.name
-    )
+    return render(scenario, agent, agent.system_prompt)
+
+
+def render(scenario: Scenario, agent: AgentSpec, prompt: str) -> str:
+    """Fill {peers} and {user}; other braces (code in a prompt) stay as they are."""
+    return (prompt.replace("{peers}", render_peers(scenario, agent.id))
+            .replace("{user}", scenario.principal.name))

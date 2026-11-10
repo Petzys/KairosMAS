@@ -1,4 +1,4 @@
-"""The `mascase/0.1` file format.
+"""The `mascase/0.2` file format.
 
 Two files describe a benchmark scenario; nothing in them is specific to a defense:
 
@@ -14,7 +14,8 @@ adapter, outside this package, and is derived from the annotations here. A run p
 Conventions
 -----------
 * Security checks return True when the **attacker's goal is met** (AgentDojo convention).
-* Check references: `agentdojo:<version>:<suite>:<task_id>` or `python:<module>:<function>`.
+* Check references: `agentdojo:<version>:<suite>:<task_id>` or `python:<module>:<function>`
+  (called as `function(ctx, **args)` with a `masbench.checks.CheckContext`).
 * Agent cards are the subset of the A2A `AgentCard` that is known before deployment; `url` and
   transport fields are filled in by the runner.
 """
@@ -61,6 +62,7 @@ class ToolSpec(_Model):
         description="untrusted = the output can contain third-party (attacker-controllable) content"
     )
     output_sensitivity: Sensitivity = Field(description="Confidentiality of the output")
+    board: str | None = Field(default=None, description="Id of the shared board the tool reads or writes")
 
 
 class AgentSkill(_Model):
@@ -151,7 +153,7 @@ class Principal(_Model):
 
 
 class Scenario(_Model):
-    format: Literal["mascase/0.1"] = FORMAT
+    format: Literal["mascase/0.2"] = FORMAT
     id: str
     benchmark: str = Field(description="B1, B2, ...")
     description: str = ""
@@ -245,7 +247,8 @@ class CompromisedAgent(_Model):
 
 
 class Attacker(_Model):
-    position: Literal["A1", "A3"] = Field(description="SoK adversary position: A1 external, A3 member")
+    position: Literal["A1", "A3", "A1+A3"] = Field(
+        description="SoK adversary position: A1 external content, A3 member agent(s), or both")
     goal: str
     injections: list[Injection] = Field(default_factory=list)
     board_writes: list[BoardWrite] = Field(default_factory=list)
@@ -255,8 +258,10 @@ class Attacker(_Model):
 class Check(_Model):
     ref: str = Field(description="agentdojo:<version>:<suite>:<task_id> | python:<module>:<fn>")
     reads: list[Literal["state", "output", "trace"]] = Field(
-        description="What the check inspects: environment state, final answer, tool-call trace"
+        description="What the check inspects: environment state (incl. the sink log), final "
+        "answer, tool-call and message trace"
     )
+    args: dict[str, Any] = Field(default_factory=dict, description="python checks: keyword arguments")
 
 
 class Scoring(_Model):
@@ -273,6 +278,22 @@ class Labels(_Model):
     """Facts about a case, used to stratify results. Never shown to agents or defenses."""
 
     source: str
+    core_id: str | None = Field(default=None, description="B2: stable id in b2_core.csv (B2-07)")
+    case_id: str | None = Field(default=None, description="B2: id in the attack catalogue")
+    primary_class: str | None = None
+    origin: Literal["as-is", "adapted", "synthetic"] | None = None
+    adversary: str | None = None
+    sok_paths: list[str] = Field(default_factory=list)
+    sok_risks: list[str] = Field(default_factory=list)
+    delivery: str | None = None
+    shared_board: Literal["yes", "no", "variant"] | None = None
+    attack_path: str | None = Field(default=None, description="Agent/board chain the attack must cross")
+    path_agents: list[str] = Field(
+        default_factory=list, description="Agent and board ids on attack_path, in order (path check)")
+    payload_source: Literal["verbatim", "written"] | None = Field(
+        default=None, description="verbatim = copied from the seed; written = made for this benchmark")
+    seed: str | None = Field(default=None, description="Repo + commit or paper the case comes from")
+    impl_note: str | None = None
     user_task: str | None = None
     injection_task: str | None = None
     sok_path: str | None = None
@@ -295,24 +316,41 @@ class Budget(_Model):
 
 
 class Case(_Model):
-    format: Literal["mascase/0.1"] = FORMAT
+    format: Literal["mascase/0.2"] = FORMAT
     id: str
     scenario: str
-    kind: Literal["benign", "attack"]
+    kind: Literal["benign", "attack", "control"] = Field(
+        description="control = an attack case with one fragment removed; its security check must stay False")
     benign_twin: str | None = None
+    control_of: str | None = Field(default=None, description="control: id of the attack case")
+    setup: dict[str, Any] = Field(
+        default_factory=dict, description="Case-specific parameters of the environment's initial state")
     user: UserTurn
     attacker: Attacker | None = None
     scoring: Scoring
     labels: Labels
     budget: Budget = Field(default_factory=Budget)
+    script: dict[str, list[list[dict[str, Any]]]] | None = Field(
+        default=None,
+        description="Ground truth for `--brain replay`: per agent, one action list per activation. "
+        "Actions: {tool, args} | {send, text} | {reply}. Attack cases script the attack, benign "
+        "cases the task. Never shown to agents or defenses.",
+    )
 
     @model_validator(mode="after")
     def _kind(self) -> Case:
-        if (self.kind == "attack") != (self.attacker is not None):
-            raise ValueError("attack cases need an attacker, benign cases must not have one")
-        if (self.kind == "attack") != (self.scoring.security is not None):
-            raise ValueError("attack cases need a security check, benign cases must not have one")
+        hostile = self.kind != "benign"
+        if hostile != (self.attacker is not None):
+            raise ValueError("attack and control cases need an attacker, benign cases must not have one")
+        if hostile != (self.scoring.security is not None):
+            raise ValueError("attack and control cases need a security check, benign cases must not")
+        if (self.kind == "control") != (self.control_of is not None):
+            raise ValueError("exactly the control cases name the attack case they control")
         return self
+
+    @property
+    def variant(self) -> str:
+        return {"benign": "twin", "attack": "attack", "control": "control"}[self.kind]
 
 
 # --------------------------------------------------------------------------- run records
@@ -325,9 +363,10 @@ class ToolCallRecord(_Model):
     args: dict[str, Any]
     result: str | None = None
     error: str | None = None
+    executed: bool = Field(default=False, description="The call reached the environment")
     blocked_by_defense: str | None = None
     defense_note: str | None = Field(
-        default=None, description="e.g. 'held' (result was a stub) or 'committed after review'")
+        default=None, description="e.g. 'held' (result was a stub), 'args modified', 'committed after review'")
     t_start: float
     t_end: float
 
@@ -341,6 +380,7 @@ class MessageRecord(_Model):
     mode: Literal["sync", "async"]
     sender_seq: int
     text: str
+    meta: dict[str, Any] = Field(default_factory=dict, description="Metadata a defense attached")
     status: Literal["delivered", "rejected", "failed"] = "delivered"
     reason: str | None = None
     t_sent: float
@@ -363,13 +403,37 @@ class AgentStats(_Model):
     transcript: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class DefenseEvent(_Model):
+    """One decision of a defense, in a form that is comparable across defenses."""
+
+    t: float
+    hook: str = Field(description="before_tool | after_tool | on_message | on_receive | on_final | isolate | <own>")
+    agent: str
+    target: str = Field(default="", description="Tool name, peer agent, ...")
+    decision: str = Field(description="deny | replace | modify | abort | isolate | flag | ...")
+    reason: str = ""
+
+
+class LLMUsage(_Model):
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
 class RunRecord(_Model):
-    format: Literal["mascase/0.1"] = FORMAT
+    format: Literal["mascase/0.2"] = FORMAT
     case: str
     scenario: str
     defense: str
     defense_options: dict[str, Any] = Field(default_factory=dict)
     model: str
+    variant: Literal["attack", "twin", "control"] = "twin"
+    repetition: int = 1
+    labels: dict[str, Any] = Field(default_factory=dict, description="Copy of the case labels")
+    not_applicable: str | None = Field(
+        default=None, description="Why the defense cannot run this scenario (the case was not run)")
+    aborted: str | None = Field(default=None, description="Reason, if the defense aborted the run")
+    isolated: dict[str, str] = Field(default_factory=dict, description="agent -> reason")
     utility: bool | None = None
     security: bool | None = Field(default=None, description="True = attacker goal met")
     final_output: str | None = None
@@ -378,7 +442,11 @@ class RunRecord(_Model):
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     messages: list[MessageRecord] = Field(default_factory=list)
     intervals: list[Interval] = Field(default_factory=list)
+    defense_events: list[DefenseEvent] = Field(default_factory=list)
+    defense_llm: LLMUsage = Field(default_factory=LLMUsage, description="The defense's own model calls")
     defense_log: list[dict[str, Any]] = Field(default_factory=list)
+    sink: list[dict[str, Any]] = Field(
+        default_factory=list, description="Requests that left the MAS to a non-allowlisted host")
     t_start: float = 0.0
     t_end: float = 0.0
 

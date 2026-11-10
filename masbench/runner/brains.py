@@ -49,17 +49,19 @@ class LLMBrain:
 
     def __init__(self, model: str, base_url: str | None = None, api_key_env: str = "OPENAI_API_KEY",
                  temperature: float = 0.0, max_retries: int = 3, timeout: float = 300.0,
-                 extra_body: dict[str, Any] | None = None) -> None:
+                 extra_body: dict[str, Any] | None = None, seed: int | None = None) -> None:
         from openai import AsyncOpenAI
 
         self.model, self.temperature, self.extra_body = model, temperature, extra_body or {}
+        self.seed = seed
         self.client = AsyncOpenAI(base_url=base_url, api_key=os.environ.get(api_key_env, "EMPTY"),
                                   max_retries=max_retries, timeout=timeout)
 
     async def step(self, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Turn:
         resp = await self.client.chat.completions.create(
             model=self.model, messages=history, tools=tools or None,
-            temperature=self.temperature, extra_body=self.extra_body or None)
+            temperature=self.temperature, extra_body=self.extra_body or None,
+            **({} if self.seed is None else {"seed": self.seed}))
         msg = resp.choices[0].message
         usage = resp.usage
         return Turn(
@@ -103,3 +105,47 @@ class ReplayWorker:
                 return Turn("Noted.")  # a notice (e.g. from a defense), not a request
             return Turn(None, [_call(req["call"], req["args"])])
         return Turn(last["content"])
+
+
+class ScriptedBrain:
+    """Replays a case's ground-truth script for one agent (`Case.script[agent]`).
+
+    The script holds one action list per activation (= per request the agent receives).
+    Actions: `{"tool": name, "args": {...}}`, `{"send": agent, "text": ...}` (synchronous),
+    `{"reply": text}` (ends the activation; default reply is the last tool result). In every
+    string, `{last}` stands for the agent's latest tool result or peer answer and `{request}`
+    for the request being handled, so content really flows through tools, messages and
+    boards instead of being restated by the script."""
+
+    def __init__(self, activations: list[list[dict[str, Any]]]) -> None:
+        self.activations = [list(a) for a in activations]
+        self.current: list[dict[str, Any]] | None = None
+
+    @staticmethod
+    def _fill(obj: Any, last: str, request: str) -> Any:
+        if isinstance(obj, str):
+            return obj.replace("{last}", last).replace("{request}", request)
+        if isinstance(obj, dict):
+            return {k: ScriptedBrain._fill(v, last, request) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [ScriptedBrain._fill(v, last, request) for v in obj]
+        return obj
+
+    async def step(self, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Turn:
+        last = next((m["content"] for m in reversed(history) if m["role"] == "tool"), "")
+        last = last.split("\n", 1)[1] if last.startswith("Answer from `") and "\n" in last else last
+        request = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+        if request.startswith("[Message from agent") and "\n" in request:
+            request = request.split("\n", 1)[1]
+        if self.current is None:
+            self.current = self.activations.pop(0) if self.activations else []
+        if not self.current:
+            self.current = None
+            return Turn(last or "Done.")
+        action = self._fill(self.current.pop(0), last, request)
+        if "reply" in action:
+            self.current = None
+            return Turn(action["reply"])
+        if "send" in action:
+            return Turn(None, [_call("send_message", {"agent_id": action["send"], "message": action["text"]})])
+        return Turn(None, [_call(action["tool"], action.get("args", {}))])

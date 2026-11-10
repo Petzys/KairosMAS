@@ -42,6 +42,49 @@
    "title": "AgentStats",
    "type": "object"
   },
+  "DefenseEvent": {
+   "additionalProperties": false,
+   "description": "One decision of a defense, in a form that is comparable across defenses.",
+   "properties": {
+    "t": {
+     "title": "T",
+     "type": "number"
+    },
+    "hook": {
+     "description": "before_tool | after_tool | on_message | on_receive | on_final | isolate | <own>",
+     "title": "Hook",
+     "type": "string"
+    },
+    "agent": {
+     "title": "Agent",
+     "type": "string"
+    },
+    "target": {
+     "default": "",
+     "description": "Tool name, peer agent, ...",
+     "title": "Target",
+     "type": "string"
+    },
+    "decision": {
+     "description": "deny | replace | modify | abort | isolate | flag | ...",
+     "title": "Decision",
+     "type": "string"
+    },
+    "reason": {
+     "default": "",
+     "title": "Reason",
+     "type": "string"
+    }
+   },
+   "required": [
+    "t",
+    "hook",
+    "agent",
+    "decision"
+   ],
+   "title": "DefenseEvent",
+   "type": "object"
+  },
   "Interval": {
    "additionalProperties": false,
    "properties": {
@@ -76,6 +119,28 @@
     "t_end"
    ],
    "title": "Interval",
+   "type": "object"
+  },
+  "LLMUsage": {
+   "additionalProperties": false,
+   "properties": {
+    "calls": {
+     "default": 0,
+     "title": "Calls",
+     "type": "integer"
+    },
+    "prompt_tokens": {
+     "default": 0,
+     "title": "Prompt Tokens",
+     "type": "integer"
+    },
+    "completion_tokens": {
+     "default": 0,
+     "title": "Completion Tokens",
+     "type": "integer"
+    }
+   },
+   "title": "LLMUsage",
    "type": "object"
   },
   "MessageRecord": {
@@ -121,6 +186,12 @@
     "text": {
      "title": "Text",
      "type": "string"
+    },
+    "meta": {
+     "additionalProperties": true,
+     "description": "Metadata a defense attached",
+     "title": "Meta",
+     "type": "object"
     },
     "status": {
      "default": "delivered",
@@ -220,6 +291,12 @@
      "default": null,
      "title": "Error"
     },
+    "executed": {
+     "default": false,
+     "description": "The call reached the environment",
+     "title": "Executed",
+     "type": "boolean"
+    },
     "blocked_by_defense": {
      "anyOf": [
       {
@@ -242,7 +319,7 @@
       }
      ],
      "default": null,
-     "description": "e.g. 'held' (result was a stub) or 'committed after review'",
+     "description": "e.g. 'held' (result was a stub), 'args modified', 'committed after review'",
      "title": "Defense Note"
     },
     "t_start": {
@@ -269,8 +346,8 @@
  "additionalProperties": false,
  "properties": {
   "format": {
-   "const": "mascase/0.1",
-   "default": "mascase/0.1",
+   "const": "mascase/0.2",
+   "default": "mascase/0.2",
    "title": "Format",
    "type": "string"
   },
@@ -294,6 +371,61 @@
   "model": {
    "title": "Model",
    "type": "string"
+  },
+  "variant": {
+   "default": "twin",
+   "enum": [
+    "attack",
+    "twin",
+    "control"
+   ],
+   "title": "Variant",
+   "type": "string"
+  },
+  "repetition": {
+   "default": 1,
+   "title": "Repetition",
+   "type": "integer"
+  },
+  "labels": {
+   "additionalProperties": true,
+   "description": "Copy of the case labels",
+   "title": "Labels",
+   "type": "object"
+  },
+  "not_applicable": {
+   "anyOf": [
+    {
+     "type": "string"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "description": "Why the defense cannot run this scenario (the case was not run)",
+   "title": "Not Applicable"
+  },
+  "aborted": {
+   "anyOf": [
+    {
+     "type": "string"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "description": "Reason, if the defense aborted the run",
+   "title": "Aborted"
+  },
+  "isolated": {
+   "additionalProperties": {
+    "type": "string"
+   },
+   "description": "agent -> reason",
+   "title": "Isolated",
+   "type": "object"
   },
   "utility": {
    "anyOf": [
@@ -372,12 +504,32 @@
    "title": "Intervals",
    "type": "array"
   },
+  "defense_events": {
+   "items": {
+    "$ref": "#/$defs/DefenseEvent"
+   },
+   "title": "Defense Events",
+   "type": "array"
+  },
+  "defense_llm": {
+   "$ref": "#/$defs/LLMUsage",
+   "description": "The defense's own model calls"
+  },
   "defense_log": {
    "items": {
     "additionalProperties": true,
     "type": "object"
    },
    "title": "Defense Log",
+   "type": "array"
+  },
+  "sink": {
+   "description": "Requests that left the MAS to a non-allowlisted host",
+   "items": {
+    "additionalProperties": true,
+    "type": "object"
+   },
+   "title": "Sink",
    "type": "array"
   },
   "t_start": {

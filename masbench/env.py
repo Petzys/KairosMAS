@@ -1,18 +1,22 @@
-"""Environment adapters: the shared world all agents act on, and the scoring checks.
+"""Environment adapters: the shared world all agents act on.
 
-All agents of a run act on the *same* environment object, so AgentDojo's checks score the
-combined effect of the system unchanged. B2 environments implement the same interface
-(`environment.kind: python`, `module: <module>:<factory>`).
+All agents of a run act on the *same* environment object, so checks score the combined
+effect of the system. Two kinds:
+
+* `agentdojo`: an AgentDojo suite (B1, and the B2 cases built on the B1 suites). AgentDojo
+  is imported only when such an environment is made.
+* `python`: `module: <module>:<factory>` returning an environment, normally a
+  `masbench.sim.SimEnvironment` subclass (B2).
+
+Scoring goes through `masbench.checks.score`: `python:` checks work on every kind,
+`agentdojo:` checks are native to the AgentDojo adapter.
 """
 from __future__ import annotations
 
 import importlib
+from ast import literal_eval
 from dataclasses import dataclass
 from typing import Any, Protocol
-
-from agentdojo.agent_pipeline.tool_execution import tool_result_to_str
-from agentdojo.functions_runtime import FunctionCall, FunctionsRuntime
-from agentdojo.task_suite.load_suites import get_suite
 
 from masbench.schema import Case, Check, Scenario
 
@@ -25,7 +29,7 @@ class ToolOutcome:
 
 class Environment(Protocol):
     def openai_tools(self, names: list[str]) -> list[dict[str, Any]]: ...
-    def run_tool(self, function: str, args: dict[str, Any]) -> ToolOutcome: ...
+    def run_tool(self, function: str, args: dict[str, Any], agent: str = "") -> ToolOutcome: ...
     def score(self, check: Check, final_output: str, trace: list[tuple[str, dict]]) -> bool: ...
     def ground_truth(self, check: Check) -> tuple[list[tuple[str, dict]], str]: ...
     def snapshot(self) -> Any: ...
@@ -33,17 +37,32 @@ class Environment(Protocol):
 
 
 class AgentDojoEnvironment:
-    """One AgentDojo suite environment with the case's injections in place."""
+    """One AgentDojo suite environment with the case's injections in place.
+
+    `case.setup` may carry `init_task` (a user task whose `init_environment` prepares the
+    state) for cases that are scored by python checks."""
 
     def __init__(self, scenario: Scenario, case: Case, injections: dict[str, str]) -> None:
+        from agentdojo.functions_runtime import FunctionsRuntime
+        from agentdojo.task_suite.load_suites import get_suite
+
         spec = scenario.environment
         self.version, self.suite_name = spec.version, spec.suite
         self.suite = get_suite(spec.version, spec.suite)
         self.runtime = FunctionsRuntime(self.suite.tools)
+        self.sink: list[dict[str, Any]] = []
         env = self.suite.load_and_inject_default_environment(injections)
-        ut = self._task(case.scoring.utility)
-        self.env = ut.init_environment(env)
+        init = case.scoring.utility.ref if case.scoring.utility.ref.startswith("agentdojo:") else None
+        if init is not None:
+            env = self._task(case.scoring.utility).init_environment(env)
+        elif case.setup.get("init_task"):
+            env = self.suite.user_tasks[case.setup["init_task"]].init_environment(env)
+        self.env = env
         self.pre_env = self.env.model_copy(deep=True)
+
+    @property
+    def state(self) -> Any:
+        return self.env
 
     def _task(self, check: Check):  # noqa: ANN202
         kind, version, suite, task_id = check.ref.split(":")
@@ -57,11 +76,19 @@ class AgentDojoEnvironment:
             "name": n, "description": fns[n].description,
             "parameters": fns[n].parameters.model_json_schema()}} for n in names]
 
-    def run_tool(self, function: str, args: dict[str, Any]) -> ToolOutcome:
+    def run_tool(self, function: str, args: dict[str, Any], agent: str = "") -> ToolOutcome:
+        from agentdojo.agent_pipeline.tool_execution import is_string_list, tool_result_to_str
+
+        args = dict(args)
+        for k, v in list(args.items()):  # as AgentDojo's ToolsExecutor: "['a', 'b']" -> list
+            if isinstance(v, str) and is_string_list(v):
+                args[k] = literal_eval(v)
         result, error = self.runtime.run_function(self.env, function, args)
         return ToolOutcome(result=tool_result_to_str(result) if error is None else "", error=error)
 
     def score(self, check: Check, final_output: str, trace: list[tuple[str, dict]]) -> bool:
+        from agentdojo.functions_runtime import FunctionCall
+
         task = self._task(check)
         calls = [FunctionCall(function=f, args=a) for f, a in trace]
         is_user = check.ref.split(":")[-1].startswith("user_task")

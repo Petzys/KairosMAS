@@ -6,8 +6,8 @@ import asyncio
 import pytest
 import yaml
 
-from kairos.adapters.masbench import policies
-from kairos.adapters.masbench.layouts import load_layouts, scenario_dir, set_partitions
+from masbench.defenses.kairos import policies
+from masbench.defenses.kairos.layouts import load_layouts, scenario_dir, set_partitions
 from masbench import io
 from masbench.b1.partition import SUITES
 from masbench.runner.defense import load_defense
@@ -63,7 +63,7 @@ def test_written_policies_are_current(suite: str) -> None:
     base = scenario_dir(f"b1.{suite}")
     for a in s.agents:
         assert yaml.safe_load((base / "agents" / f"{a.id}.yaml").read_text()) == \
-            policies.agent_policy(s, a.id, raw, source), "run `python -m kairos.adapters.masbench`"
+            policies.agent_policy(s, a.id, raw, source), "run `python -m masbench.defenses.kairos`"
 
 
 def test_kairos_per_agent_peer_trust_dilemma() -> None:
@@ -84,4 +84,4 @@ def test_kairos_per_agent_peer_trust_dilemma() -> None:
 
 def test_kairos_per_agent_loads_by_entry_point_name() -> None:
     d = load_defense("kairos-per-agent", judge_model="deterministic")
-    assert type(d).__module__ == "kairos.adapters.masbench.per_agent"
+    assert type(d).__module__ == "masbench.defenses.kairos.per_agent"
