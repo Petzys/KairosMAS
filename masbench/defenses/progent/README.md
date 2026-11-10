@@ -1,6 +1,6 @@
 # progent (R08)
 
-Status: **not ported yet**. This directory fixes where the adapter lives and how it attaches.
+Status: **implemented** on the Progent library (`secagent`) vendored in the AutoDojo checkout; see the module docstring for the lifting rules and options.
 
 Programmable privilege control (Shi et al. 2026): a per-agent policy over tool calls that
 allows, forbids or constrains the arguments of each tool.

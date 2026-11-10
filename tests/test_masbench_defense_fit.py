@@ -250,7 +250,7 @@ def test_adapter_directories() -> None:
     assert {"none", "kairos", "pi-detector", "spotlighting", "sandwiching", "progent", "camel", "multi-camel",
             "safeflow", "blindguard"} <= set(names)
     assert defense_class("none") is Defense and defense_class("undefended") is Defense
-    for name in ("pi-detector", "spotlighting", "sandwiching", "progent", "camel", "multi-camel", "safeflow", "blindguard"):
+    for name in ("camel", "multi-camel", "safeflow", "blindguard"):
         cls = defense_class(name)
         assert cls.hooks and cls.run_id.startswith("R")
         with pytest.raises(NotImplementedError, match="not ported yet"):

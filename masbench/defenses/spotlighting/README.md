@@ -1,6 +1,6 @@
 # spotlighting (R06)
 
-Status: **not ported yet**. This directory fixes where the adapter lives and how it attaches.
+Status: **implemented**. Implemented in `__init__.py` with AgentDojo's wording and delimiters.
 
 Marks untrusted content as data (Hines et al. 2024): delimiting or datamarking, plus a
 system-prompt instruction not to follow anything inside the marks.

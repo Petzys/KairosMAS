@@ -1,6 +1,6 @@
 # pi-detector (R05)
 
-Status: **not ported yet**. This directory fixes where the adapter lives and how it attaches.
+Status: **implemented**. Implemented in `__init__.py` with AgentDojo's classifier, threshold and replacement text.
 
 A prompt-injection classifier on every piece of untrusted input an agent receives. Lifted per
 agent: tool outputs and received A2A messages are both scanned.
@@ -9,7 +9,7 @@ agent: tool outputs and received A2A messages are both scanned.
 |---|---|
 | Level | Model |
 | Hooks | `after_tool` (tool outputs), `on_receive` (requests and replies) |
-| Decision | `Verdict.abort` on a flagged input (AgentDojo behaviour), or `Verdict.deny` to withhold only that input (option) |
+| Decision | A flagged input is replaced by AgentDojo's omission text; `on_detect: abort` ends the run instead |
 | Inputs from the scenario | `ToolSpec.output_trust` to skip trusted outputs (option) |
 | Own model calls | One classifier call per input; a local classifier model, or `ctx.llm()` for an LLM detector (metered in `defense_llm`) |
 | Changes the agent | No |

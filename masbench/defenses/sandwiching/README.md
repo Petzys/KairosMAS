@@ -1,6 +1,6 @@
 # sandwiching (R07)
 
-Status: **not ported yet**. This directory fixes where the adapter lives and how it attaches.
+Status: **implemented**. Implemented in `__init__.py` (AgentDojo `repeat_user_prompt`, rebuilt per model call in `before_llm`).
 
 Repeats the task after untrusted content, so the last instruction the model reads is the
 legitimate one.

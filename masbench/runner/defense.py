@@ -160,6 +160,9 @@ class RunContext:
     event: Callable[..., None] | None = None
     # llm(model=None) -> AuxLLM. None when the run has no model endpoint (replay).
     llm: Callable[..., AuxLLM] | None = None
+    # meter(calls, prompt_tokens, completion_tokens): account for model calls the defense
+    # made with a client of its own (a library that brings its own client).
+    meter: Callable[[int, int, int], None] | None = None
 
 
 class Defense:

@@ -295,6 +295,7 @@ class MASRun:
         self.ctx.execute_tool = self.execute_committed
         self.ctx.isolate = self.isolate
         self.ctx.event = self.event
+        self.ctx.meter = self.meter
         if aux_llm is not None:
             self.ctx.llm = lambda model=None: aux_llm(model, self.record.defense_llm)
 
@@ -318,6 +319,12 @@ class MASRun:
     def event(self, hook: str, agent: str, decision: str, reason: str = "", target: str = "") -> None:
         self.record.defense_events.append(DefenseEvent(
             t=time.monotonic() - self.t0, hook=hook, agent=agent, target=target, decision=decision, reason=reason))
+
+    def meter(self, calls: int, prompt_tokens: int, completion_tokens: int) -> None:
+        usage = self.record.defense_llm
+        usage.calls += calls
+        usage.prompt_tokens += prompt_tokens
+        usage.completion_tokens += completion_tokens
 
     def note(self, verdict: Verdict, hook: str, agent: str, target: str = "") -> None:
         """Record a non-allow verdict; an abort verdict ends the run."""
