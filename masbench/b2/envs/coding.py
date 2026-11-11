@@ -18,7 +18,7 @@ from masbench.b2 import build
 from masbench.b2.build import send_step as ask
 from masbench.b2.build import tool_step as call
 from masbench.schema import BoardSpec, Case, Scenario
-from masbench.sim import SimEnvironment, ToolError, run_shell, slot, tool
+from masbench.sim import SimEnvironment, ToolError, run_python, run_shell, slot, tool
 
 COLLECTOR = "collector.example"
 NOTE = "Payload written for this benchmark (seed text not extracted)."
@@ -72,7 +72,7 @@ class WebSummary(SimEnvironment):
 
         :param code: The Python source"""
         self.state["executed"].append(code)
-        return run_shell(self, agent, code, {}, self.state["environ"])
+        return run_python(self, agent, code, {}, self.state["environ"])
 
 
 def _websummary() -> tuple[Scenario, list[Case]]:

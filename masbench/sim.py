@@ -131,6 +131,9 @@ class SimEnvironment:
         fn = self._tools().get(function)
         if fn is None:
             return ToolOutcome("", f"ToolNotFoundError: `{function}`")
+        hints = typing.get_type_hints(fn)
+        args = {k: " ".join(map(str, v)) if isinstance(v, list) and hints.get(k) is str else v
+                for k, v in args.items()}  # a command given as an argv list
         try:
             inspect.signature(fn).bind(self, agent, **args)
         except TypeError as e:
@@ -205,14 +208,12 @@ def run_shell(env: SimEnvironment, agent: str, text: str, files: dict[str, str],
     `cat`, package installs, running a script file) and return their output."""
     if depth > 3:
         return ""
+    heredoc = _HEREDOC.search(text)
+    if heredoc:  # python - <<'PY' ... PY
+        return run_python(env, agent, heredoc.group(2), files, environ, depth + 1)
+    if _PY_REQUEST.search(text) or _URLOPEN.search(text) or _looks_like_python(text):
+        return run_python(env, agent, text, files, environ, depth + 1)
     out: list[str] = []
-    for m in list(_PY_REQUEST.finditer(text)) + list(_URLOPEN.finditer(text)):
-        method, url, rest = (m.group(1), m.group(2), m.group(3)) if m.re is _PY_REQUEST else ("post", m.group(1), m.group(2))
-        body = _ENV_REF.sub(lambda r: environ.get(r.group(1) or r.group(2), ""), rest)
-        body = _OPEN_REF.sub(lambda r: _file(files, r.group(1)), body)
-        out.append(env.request(agent, method, url, body.strip(" ,")))
-    if out:
-        return "\n".join(out)
     for line in _commands(text):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -244,6 +245,30 @@ def _commands(text: str) -> list[str]:
     if not skip:
         out.append(cur)
     return out
+
+
+_HEREDOC = re.compile(r"python3?\s+-\s*<<-?\s*['\"]?(\w+)['\"]?\n(.*?)\n\1", re.S)
+_OS_SYSTEM = re.compile(r"(?:os\.system|subprocess\.(?:run|call|check_output|check_call|Popen))\(\s*(?:f?['\"])([^'\"]+)['\"]")
+
+
+def _looks_like_python(text: str) -> bool:
+    return bool(re.search(r"^\s*(import \w|from \w+ import |def \w+\(|class \w+|print\()", text, re.M))
+
+
+def run_python(env: SimEnvironment, agent: str, code: str, files: dict[str, str],
+               environ: dict[str, str], depth: int = 0) -> str:
+    """"Execute" Python source: perform the HTTP requests it makes (requests, urlopen) and the
+    shell commands it passes to os.system / subprocess as one string. Nothing else is run."""
+    out: list[str] = []
+    for m in list(_PY_REQUEST.finditer(code)) + list(_URLOPEN.finditer(code)):
+        method, url, rest = (m.group(1), m.group(2), m.group(3)) if m.re is _PY_REQUEST else ("post", m.group(1), m.group(2))
+        body = _ENV_REF.sub(lambda r: environ.get(r.group(1) or r.group(2), ""), rest)
+        body = _OPEN_REF.sub(lambda r: _file(files, r.group(1)), body)
+        out.append(env.request(agent, method, url, body.strip(" ,")))
+    for m in _OS_SYSTEM.finditer(code):
+        if depth <= 3:
+            out.append(run_shell(env, agent, m.group(1), files, environ, depth + 1))
+    return "\n".join(o for o in out if o) or "(executed without errors)"
 
 
 def _file(files: dict[str, str], path: str) -> str:
@@ -320,9 +345,14 @@ def _shell_line(env: SimEnvironment, agent: str, line: str, files: dict[str, str
     if cmd in ("cd", "export", "set", "mkdir", "touch", "chmod", "true", "test", "git", "sleep", "source", "which"):
         return ""
     if cmd in ("python", "python3") and "-c" in argv:
-        return run_shell(env, agent, argv[argv.index("-c") + 1], files, environ, depth + 1) if "requests." in line or "urlopen" in line else "(executed without errors)"
+        return run_python(env, agent, argv[argv.index("-c") + 1], files, environ, depth + 1)
+    if cmd == "echo":
+        return _expand(" ".join(argv[1:]), files, environ)
     if cmd in ("bash", "sh", "python", "python3", "node") or cmd.endswith((".sh", ".py")):
         path = argv[1] if cmd in ("bash", "sh", "python", "python3", "node") and len(argv) > 1 else argv[0]
         body = _file(files, path)
-        return run_shell(env, agent, body, files, environ, depth + 1) if body else f"{path}: not found"
+        if not body:
+            return f"{path}: not found"
+        python = cmd.startswith("python") or path.endswith(".py")
+        return (run_python if python else run_shell)(env, agent, body, files, environ, depth + 1)
     return f"sh: {cmd}: not available in this sandbox (available: ls, cat, grep, find, echo, rm, curl, wget, pip, npm, sh, python)"
