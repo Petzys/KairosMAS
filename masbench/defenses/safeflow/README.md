@@ -1,6 +1,6 @@
 # safeflow (R25)
 
-Status: **not ported yet**. This directory fixes where the adapter lives and how it attaches.
+Status: **implemented** as a port that follows the paper (arXiv:2607.25255); the module docstring lists what is taken from the paper and what is this port's.
 
 Taint tracking over the agent graph with a validator in front of hard sinks (Dai et al. 2026).
 

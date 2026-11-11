@@ -106,3 +106,31 @@ def test_camel_tool_functions_are_built_from_json_schemas() -> None:
     fields = fn.parameters.model_fields
     assert set(fields) == {"recipients", "content"} and fields["recipients"].annotation == list[str]
     assert fn.run(recipients=["a@b.c"], content="x") == "ok" and ":param recipients:" in fn.full_docstring
+
+
+def test_safeflow_propagates_labels_and_validates_before_hard_sinks(monkeypatch: pytest.MonkeyPatch) -> None:
+    from masbench.defenses.safeflow import SafeFlow, capability
+
+    scn = io.load_scenario("b2.pipeline")
+    assert capability(scn.tool("npm_owner_add")) == ("send", "EXTERNAL_SEND")
+    assert capability(scn.tool("run_command")) == ("exec", "CODE_EXEC")
+    assert capability(scn.tool("repo_commit")) == ("write", None) and capability(scn.tool("read_issue"))[0] == "retrieve"
+
+    seen: list[tuple[str, str, set[str], int]] = []
+
+    async def extract(self, agent, call, labels):  # noqa: ANN001, ANN202 - stands in for the defense-side model
+        seen.append((agent, call.function, set(labels), len(self.upstream(agent))))
+        ok = call.function == "npm_publish"
+        return {"task_necessary": ok, "target_authorized": ok}
+
+    monkeypatch.setattr(SafeFlow, "extract", extract)
+    for case in ("b2.pipeline/B2-11/attack", "b2.pipeline/B2-33/attack"):  # via a message, via the board
+        seen.clear()
+        rec = run(case, "safeflow")
+        assert rec.security is False and rec.utility is True, case
+        blocked = [t for t in rec.tool_calls if t.blocked_by_defense]
+        assert [t.function for t in blocked] == ["npm_owner_add"] and "SafeFlow blocked the staged EXTERNAL_SEND" in blocked[0].blocked_by_defense
+        assert all(agent == "release" and "UNTRUSTED_CONTEXT" in labels and n > 3 for agent, _, labels, n in seen)
+        handoff = next(m for m in rec.messages if m.sender == "coder" and m.receiver == "release")
+        assert "UNTRUSTED_CONTEXT" in handoff.meta["safeflow_labels"]
+        assert [d["decision"] for d in rec.defense_log] == ["BLOCKED", "SAFE"]
