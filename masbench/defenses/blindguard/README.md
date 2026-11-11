@@ -1,6 +1,10 @@
 # blindguard (R26)
 
-Status: **not ported yet**. This directory fixes where the adapter lives and how it attaches.
+Status: **implemented**: `model.py` (detector after the released code), `train.py` (training and threshold calibration on benign records), `__init__.py` (adapter). Train before use:
+
+    python -m masbench.cli run -s 'b1.*' --kind benign --model <model> ... --out runs_masbench_b1
+    python -m masbench.defenses.blindguard.train runs_masbench_b1/none/<model>
+
 
 Graph anomaly detection on A2A messages; messages of flagged agents are pruned. Sees
 messages only, so it works with opaque agents.

@@ -250,8 +250,5 @@ def test_adapter_directories() -> None:
     assert {"none", "kairos", "pi-detector", "spotlighting", "sandwiching", "progent", "camel", "multi-camel",
             "safeflow", "blindguard"} <= set(names)
     assert defense_class("none") is Defense and defense_class("undefended") is Defense
-    for name in ("blindguard",):
-        cls = defense_class(name)
-        assert cls.hooks and cls.run_id.startswith("R")
-        with pytest.raises(NotImplementedError, match="not ported yet"):
-            cls()
+    for name in names:
+        assert issubclass(defense_class(name), Defense)

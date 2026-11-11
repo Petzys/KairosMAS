@@ -13,8 +13,8 @@ checks (python predicates)  ← committed state + sink + trace       hooks only,
   attack cases (`b1/`).
 - **B2 (MAS-unique attacks)**: the cases of `b2/core.csv` (pinned copy of the notes'
   `b2_core.csv`), each with a benign twin and, for Composition, single-fragment controls
-  (`b2/`). 43 of the 58 core cases are implemented; the rest are listed in
-  `tests/test_masbench_b2.py::DEFERRED`.
+  (`b2/`). 43 of the 58 core cases have an attack case; for the other 15 the scenario and twin
+  exist and the attacker side is read from a seed file (`b2/seeds/README.md`).
 
 ## Layout
 
@@ -68,11 +68,24 @@ environment's internals. It derives its policy from the tool annotations (`effec
 | `on_activation_end`, `drain_notices`, `on_final`, `finish` | Staging monitors |
 | `ctx.messages`, `ctx.tool_calls`, `ctx.isolate`, `ctx.event`, `ctx.llm`, `ctx.execute_tool` | Logs, agent isolation, uniform decision events, metered auxiliary model, committing a held call |
 
-`none` is the undefended run and `kairos` (`kairos-per-agent`) the per-agent KAIROS baseline.
-The other directories (`pi_detector`, `spotlighting`, `sandwiching`, `progent`, `camel`,
-`multi_camel`, `safeflow`, `blindguard`) hold a README with the hooks and inputs of the port
-and a stub. `tests/test_masbench_defense_fit.py` runs a minimal mock of each type through the
-hooks.
+| Directory | Run | Built on | Needs |
+|---|---|---|---|
+| `none` | R01 | the default hooks | - |
+| `kairos` (`kairos-per-agent`) | R03 | KAIROS reference monitor per agent | oracle model |
+| `pi_detector` | R05 | AgentDojo's detector (`protectai/deberta-v3-base-prompt-injection-v2`) | torch, transformers |
+| `spotlighting` | R06 | AgentDojo's delimiting | - |
+| `sandwiching` | R07 | AgentDojo's `repeat_user_prompt` | - |
+| `progent` | R08 | the Progent library (`secagent`) of the AutoDojo checkout | policy model |
+| `camel` | R09 | the CaMeL code of the AutoDojo checkout | `.venv-camel`, P-LLM/Q-LLM |
+| `multi_camel` | R24 | rebuild on `camel` (no released code) | as `camel` |
+| `safeflow` | R25 | port after the paper | defense-side model |
+| `blindguard` | R26 | detector after the released code, retrained | torch, transformers, a trained checkpoint |
+
+Each directory has a README with the hooks it uses and the adaptation notes (interface-only
+or mechanism-changing), and the module docstring states the lifting rules and options.
+Lifted single-agent defenses treat tool outputs and received messages as untrusted input.
+`tests/test_masbench_defenses.py` runs every adapter offline on scripted cases;
+`tests/test_masbench_defense_fit.py` shows with minimal mocks what each hook carries.
 
 ## Commands
 
@@ -84,6 +97,9 @@ python -m masbench.cli run -s 'b2.*' --brain replay --out ''          # ground t
 python -m masbench.cli run -s 'b2.*' --model gemma-4-26b-a4b-it \
     --base-url "$UZL_BASE_URL" --api-key-env UZL_API_KEY --seed --repeat 3 --out runs_masbench_b2
 python -m masbench.cli run -s b1.banking --defense kairos --defense-options '{"judge_model": "..."}'
+python -m masbench.cli run -s 'b2.*' --defense safeflow --model <model> ...
+.venv-camel/bin/python -m masbench.cli run -s 'b2.*' --defense camel \
+    --defense-options '{"model": "<model>", "base_url": "...", "api_key_env": "UZL_API_KEY"}' ...
 python -m masbench.cli summarize runs_masbench_b2          # ASR, U, Ub, NRP per class, macro average, Wilson CI
 python -m masbench.cli b2-validate runs_masbench_b2/none/gemma-4-26b-a4b-it   # Implementation Guide §5 table
 ```

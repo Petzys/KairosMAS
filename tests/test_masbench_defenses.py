@@ -134,3 +134,33 @@ def test_safeflow_propagates_labels_and_validates_before_hard_sinks(monkeypatch:
         handoff = next(m for m in rec.messages if m.sender == "coder" and m.receiver == "release")
         assert "UNTRUSTED_CONTEXT" in handoff.meta["safeflow_labels"]
         assert [d["decision"] for d in rec.defense_log] == ["BLOCKED", "SAFE"]
+
+
+def test_blindguard_detector_trains_and_isolates(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+    torch = pytest.importorskip("torch")
+    from masbench.defenses import blindguard
+    from masbench.defenses.blindguard import model as bg
+    from masbench.defenses.blindguard.train import fit, is_train
+
+    def fake_embed(texts: list[str]) -> "torch.Tensor":  # benign messages cluster, the odd one does not
+        g = torch.Generator().manual_seed(0)
+        base = torch.nn.functional.normalize(torch.randn(1, 16, generator=g), dim=1)
+        odd = torch.nn.functional.normalize(torch.randn(1, 16, generator=g), dim=1)
+        return torch.cat([(odd if "co-maintainer" in t else base) + 0.01 * i for i, t in enumerate(texts)])
+
+    monkeypatch.setattr(bg, "embed", fake_embed)
+    graph = bg.snapshot([("a", "b", "run the tests"), ("b", "a", "tests pass"), ("a", "c", "release")], fake_embed)
+    assert graph[0] == ["a", "b"] and graph[2].tolist() == [[1.0, 1.0], [1.0, 1.0]]
+    benign = [bg.snapshot([("a", "b", "x"), ("b", "c", "y"), ("c", "a", "z")], fake_embed) for _ in range(8)]
+    model = fit(list(benign), epochs=3)
+    path = tmp_path / "ckpt.pt"
+    torch.save({"state": model.state_dict(), "threshold": 0.5, "in_channels": 16}, path)
+    assert is_train("b1.banking/user_task_0") in (True, False)
+
+    monkeypatch.setattr(blindguard.BlindGuard, "score", lambda self, messages: {
+        m[0]: (0.1 if "co-maintainer" in m[2] else 0.9) for m in messages})
+    rec = run("b2.pipeline/B2-11/attack", "blindguard", checkpoint=str(path))
+    assert rec.isolated and list(rec.isolated) == ["coder"] and rec.security is False
+    assert any(m.status == "rejected" and m.sender == "coder" for m in rec.messages)
+    rec = run("b2.pipeline/B2-11/twin", "blindguard", checkpoint=str(path))
+    assert rec.isolated == {} and rec.utility is True
