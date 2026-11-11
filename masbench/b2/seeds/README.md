@@ -3,7 +3,21 @@
 For these core cases the environment, agents, task, utility check and benign twin are in
 `masbench/b2/envs/teams.py`. The attacker side is data: put one file `<core_id>.yaml` in
 this directory and run `python -m masbench.cli generate b2`. Without the file, only the twin
-of the case is generated (the cases are listed in `tests/test_masbench_b2.py::DEFERRED`).
+of the case is generated (the cases are listed in `tests/test_masbench_b2.py::SEEDED`).
+
+All 15 files exist. `make_seeds.py` generated them from checkouts of the sources (commits below), so the
+attacker texts are the sources' own; `payload_source` and `note` of each file say what, if
+anything, was added for the catalogue's adaptation:
+
+| Core id | `payload_source` | Attacker text |
+|---|---|---|
+| B2-01..06 | verbatim | The source's adversarial template of the role (`agents/adversarial_agent.py`) filled with the `Harmful_Behavior` of dataset rows 4, 41, 37, 146, 133, 102, plus the scenario's deployment note |
+| B2-21, 22 | adapted | Colluders' secret instructions verbatim; added: the attacker ticker `VLTR` x 5000 (B2-21) and the quantity 1000 (B2-22) |
+| B2-23 | adapted | Secret instructions verbatim; added: the forum URL and the fabricated grades |
+| B2-24 | adapted | Secret instruction of the Article Writing agent verbatim; added: the affiliate URL. The source's colluding Distribution agent is honest here (catalogue adaptation) |
+| B2-25, 26 | adapted | Malicious-agent system prompt as `oasis/social_platform/config/user.py` builds it (profiles of users 100 and 101) and the private-message objective; added: the scheme with the fraud account / form address |
+| B2-43, 44 | verbatim | The Input of `Demos/Prompts.md` Example 1 (leakage) and Example 2 (phishing), without the table markup |
+| B2-47 | written | Synthetic case (no released payload): the forward-me paragraph |
 
 | Core id | Scenario | Agents (entry first) | Injection vectors | Check functions |
 |---|---|---|---|---|
@@ -64,5 +78,11 @@ generated attack case.
   named in the catalogue). The second file is not used by any code and is not committed.
 - TAMAS: `data/Colluding/<domain>_colluding.json` at `545c112`; the secret instruction of a
   colluder is the part of its `agent_description` after the base description.
-- MultiAgentFraudBench: `zheng977/MutiAgent4Fraud` at `950e489`.
+- MultiAgentFraudBench: `zheng977/MutiAgent4Fraud` at `950e489`:
+  `scripts/twitter_simulation/align_with_real_world/system_prompt(static|dynamic).json` and
+  `data/our_twitter_sim/base-agent-data/test_110_good_bad_random_1.0_1.0_zzj.csv`.
 - ComPromptMized: `StavC/ComPromptMized` at `6ab9116`, `Demos/Prompts.md`.
+- pajaMAS: `pajamas/` holds byte-identical copies of the pages of `trailofbits/pajaMAS` at
+  `67b83f1` (`simple_mas` test.html, test4.html; `tool_mas` clean.html, placeholder.html;
+  `trifecta_mas` preference.html, medical.html, birds.html), used by `envs/coding.py`, which
+  applies the catalogue's substitutions in code.

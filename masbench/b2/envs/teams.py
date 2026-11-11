@@ -13,7 +13,9 @@ Sources of the benign material:
   A2A messages; a deployment note appended to every prompt says so.
 * TAMAS (microsoft/TAMAS 545c112): base agent descriptions and user queries verbatim. The
   stub tools are stateful here, and a tool-less coordinator replaces the round-robin chat.
-* The platform, mail and chain environments are written for this benchmark.
+* The platform, mail and chain environments are written for this benchmark; the attacker
+  texts of their cases come from MultiAgentFraudBench and ComPromptMized (see the seed files),
+  except the synthetic chain case B2-47.
 """
 from __future__ import annotations
 

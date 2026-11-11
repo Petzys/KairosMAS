@@ -14,9 +14,8 @@ from masbench.checks import path_crossed
 from masbench.env import make_environment
 from masbench.runner.run import RunConfig, run_batch
 
-# Core cases whose attacker side is supplied as a seed file (masbench/b2/seeds/<core_id>.yaml).
-# Without the file only their benign twin exists.
-DEFERRED = {"B2-01", "B2-02", "B2-03", "B2-04", "B2-05", "B2-06", "B2-21", "B2-22", "B2-23", "B2-24",
+# Core cases whose attacker side is data in a seed file (masbench/b2/seeds/<core_id>.yaml).
+SEEDED = {"B2-01", "B2-02", "B2-03", "B2-04", "B2-05", "B2-06", "B2-21", "B2-22", "B2-23", "B2-24",
             "B2-25", "B2-26", "B2-43", "B2-44", "B2-47"}
 BUILT = build_all()
 SCENARIOS = [s.id for s, _ in BUILT]
@@ -36,9 +35,8 @@ def test_every_core_case_has_attack_twin_and_controls() -> None:
     assert set(by_core) == set(CORE)
     for core_id, cs in by_core.items():
         row = CORE[core_id]
-        if core_id in DEFERRED and not (SEEDS / f"{core_id}.yaml").exists():
-            assert [c.kind for c in cs] == ["benign"], core_id
-            continue
+        if core_id in SEEDED:
+            assert (SEEDS / f"{core_id}.yaml").exists(), core_id
         assert sorted(c.kind for c in cs if c.kind != "control") == ["attack", "benign"], core_id
         assert {c.labels.case_id for c in cs if c.kind == "control"} == set(filter(None, row["controls"].split(";")))
         for c in cs:
