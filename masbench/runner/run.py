@@ -108,8 +108,8 @@ def record_path(out: Path, cfg: RunConfig, case: Case, repetition: int = 1) -> P
 
 async def run_batch(scenario: Scenario, cases: list[Case], cfg: RunConfig,
                     out: Path | None, concurrency: int = 4, progress: bool = True,
-                    repeat: int = 1) -> list[RunRecord]:
-    sem = asyncio.Semaphore(concurrency)
+                    repeat: int = 1, sem: asyncio.Semaphore | None = None) -> list[RunRecord]:
+    sem = sem or asyncio.Semaphore(concurrency)  # pass one semaphore to run several scenarios at once
     records: list[RunRecord] = []
 
     async def one(case: Case, rep: int) -> None:

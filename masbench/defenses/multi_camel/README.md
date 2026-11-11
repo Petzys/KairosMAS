@@ -1,6 +1,6 @@
 # multi-camel (R24)
 
-Status: **not ported yet**. This directory fixes where the adapter lives and how it attaches.
+Status: **implemented** as a rebuild on the `camel` adapter (no code is released for the paper); run masbench with `.venv-camel/bin/python`. See the module docstring.
 
 Per-agent CaMeL plus a trusted message channel ("Can CaMeLs talk?"): an A2A send carries a
 trusted `message` that must not depend on tool outputs and `variables` holding CaMeL values

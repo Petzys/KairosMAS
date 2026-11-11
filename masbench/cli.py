@@ -87,9 +87,8 @@ def cmd_run(a: argparse.Namespace) -> None:
                     temperature=a.temperature, attack=a.attack, injection_model_name=a.injection_model_name,
                     defense=a.defense, defense_options=json.loads(a.defense_options),
                     replay_mode=a.replay_mode, extra_body=json.loads(a.extra_body), seed=a.seed)
-    recs: list[RunRecord] = []
+    batches = []
     for sid in scenario_ids(a.scenario):
-        s = io.load_scenario(sid)
         cases = io.load_cases(sid)
         if a.kind:
             cases = [c for c in cases if c.kind in a.kind]
@@ -97,8 +96,15 @@ def cmd_run(a: argparse.Namespace) -> None:
             cases = [c for c in cases if any(x in c.id for x in a.cases)]
         if a.limit:
             cases = cases[: a.limit]
-        recs += asyncio.run(run_batch(s, cases, cfg, Path(a.out) if a.out else None, a.concurrency, repeat=a.repeat))
-    print_summary(recs)
+        batches.append((io.load_scenario(sid), cases))
+
+    async def all_scenarios() -> list[RunRecord]:
+        sem = asyncio.Semaphore(a.concurrency)  # shared: scenarios run side by side
+        done = await asyncio.gather(*(run_batch(s, cases, cfg, Path(a.out) if a.out else None, repeat=a.repeat, sem=sem)
+                                      for s, cases in batches))
+        return [r for recs in done for r in recs]
+
+    print_summary(asyncio.run(all_scenarios()))
 
 
 # --------------------------------------------------------------------------- summaries

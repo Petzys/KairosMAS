@@ -1,6 +1,6 @@
 # camel (R09)
 
-Status: **not ported yet**. This directory fixes where the adapter lives and how it attaches.
+Status: **implemented** on the vendored CaMeL code; run masbench with `.venv-camel/bin/python`. The module docstring has the lifting rules, the annotation-derived policy and the options.
 
 CaMeL (Debenedetti et al. 2025) on every agent individually ("individual-agent CaMeL" in
 "Can CaMeLs talk?"): a privileged LLM writes a plan from the trusted request, an interpreter

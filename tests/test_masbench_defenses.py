@@ -82,3 +82,27 @@ def test_progent_enforces_a_per_agent_policy() -> None:
     assert "blocked by security policy" in by_fn["repo_commit"].blocked_by_defense
     assert not by_fn["npm_owner_add"].executed
     assert {e.agent for e in rec.defense_events} == {"coder", "release"}
+
+
+def test_multi_camel_call_tree() -> None:
+    from masbench.defenses.multi_camel import MultiCaMeL, call_tree
+
+    star = call_tree(io.load_scenario("b1.banking"))  # complete topology: entry -> every other agent
+    assert star == {("orchestrator", a) for a in ("transactions", "files", "account")}
+    assert call_tree(io.load_scenario("b2.banking_chain")) == {
+        ("orchestrator", "files"), ("files", "account"), ("account", "transactions")}
+    dag = io.load_scenario("b2.banking_dag")
+    assert call_tree(dag) is None
+    assert "call tree" in MultiCaMeL(model="m").supports(dag)
+    assert MultiCaMeL(model="m").supports(io.load_scenario("b2.pipeline")) is None
+
+
+def test_camel_tool_functions_are_built_from_json_schemas() -> None:
+    pytest.importorskip("agentdojo")
+    from masbench.defenses.camel import make_function
+
+    spec = io.load_scenario("b2.research").tool("send_report")
+    fn = make_function(spec.name, spec.description, spec.parameters, lambda **kw: "ok")
+    fields = fn.parameters.model_fields
+    assert set(fields) == {"recipients", "content"} and fields["recipients"].annotation == list[str]
+    assert fn.run(recipients=["a@b.c"], content="x") == "ok" and ":param recipients:" in fn.full_docstring
