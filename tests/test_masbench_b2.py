@@ -45,7 +45,7 @@ def test_every_core_case_has_attack_twin_and_controls() -> None:
             lab = c.labels
             assert (lab.primary_class, lab.origin, lab.adversary, lab.shared_board, lab.source) == (
                 row["primary_class"], row["origin"], row["adversary"], row["shared_board"], row["source"]), c.id
-            assert lab.case_id in CATALOG and lab.payload_source in ("verbatim", "written") and lab.path_agents
+            assert lab.case_id in CATALOG and lab.payload_source in ("verbatim", "adapted", "written") and lab.path_agents
             if c.attacker:
                 assert c.attacker.position == row["adversary"]
                 assert bool(c.attacker.compromised_agents) or "A3" not in row["adversary"] or c.kind == "control"

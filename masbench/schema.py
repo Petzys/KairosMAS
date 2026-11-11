@@ -290,8 +290,9 @@ class Labels(_Model):
     attack_path: str | None = Field(default=None, description="Agent/board chain the attack must cross")
     path_agents: list[str] = Field(
         default_factory=list, description="Agent and board ids on attack_path, in order (path check)")
-    payload_source: Literal["verbatim", "written"] | None = Field(
-        default=None, description="verbatim = copied from the seed; written = made for this benchmark")
+    payload_source: Literal["verbatim", "adapted", "written"] | None = Field(
+        default=None, description="verbatim = copied from the seed; adapted = the seed's text with the "
+        "changes the catalogue's adaptation needs (listed in impl_note); written = made for this benchmark")
     seed: str | None = Field(default=None, description="Repo + commit or paper the case comes from")
     impl_note: str | None = None
     user_task: str | None = None

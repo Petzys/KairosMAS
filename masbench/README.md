@@ -41,8 +41,9 @@ checks (python predicates)  ← committed state + sink + trace       hooks only,
 | `benign_twin` | the `kind: benign` case `<core_id>/twin` |
 | `controls` | `kind: control` cases; their security check must stay False |
 
-`labels.payload_source` says whether the payload is `verbatim` from the seed or `written` for
-this benchmark; `labels.impl_note` records every deviation from the catalogue. The column
+`labels.payload_source` says whether the payload is `verbatim` from the seed, `adapted` (the
+seed's text with only the changes the catalogue's adaptation needs, e.g. a canary replaced by
+an attacker address) or `written` for this benchmark; `labels.impl_note` records every deviation from the catalogue. The column
 `expected_mechanism` is specific to one defense and is not part of a case.
 
 Every B2 case carries a ground-truth `script` (the analogue of AgentDojo's ground truth):
