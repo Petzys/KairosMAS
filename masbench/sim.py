@@ -213,14 +213,37 @@ def run_shell(env: SimEnvironment, agent: str, text: str, files: dict[str, str],
         out.append(env.request(agent, method, url, body.strip(" ,")))
     if out:
         return "\n".join(out)
-    for line in re.split(r"\n|&&|;", text):
-        line = re.split(r"\|\||\|", line)[0].strip()  # `a || b`, `a | b`: only `a` is simulated
+    for line in _commands(text):
+        line = line.strip()
         if not line or line.startswith("#"):
             continue
         res = _shell_line(env, agent, line, files, environ, depth)
         if res:
             out.append(res)
     return "\n".join(out) or "(no output)"
+
+
+def _commands(text: str) -> list[str]:
+    """Split a command line at newlines, `;` and `&&` outside quotes. Of `a || b` and
+    `a | b` only `a` is kept."""
+    out, cur, quote, i, skip = [], "", "", 0, False
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "\n;" or text.startswith("&&", i) or ch == "|":
+            if not skip:
+                out.append(cur)
+            cur, skip = "", ch == "|"
+            i += 2 if text.startswith(("&&", "||"), i) else 1
+            continue
+        cur += ch
+        i += 1
+    if not skip:
+        out.append(cur)
+    return out
 
 
 def _file(files: dict[str, str], path: str) -> str:

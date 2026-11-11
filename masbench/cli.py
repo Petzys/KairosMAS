@@ -224,8 +224,14 @@ def cmd_b2_validate(a: argparse.Namespace) -> None:
             "path_check": f"{crossed}/{len(hits)}" if hits else "n/a",
             "errors": sum(bool(r.error) for r in rs),
         }
-        row["pass"] = (len(hits) >= 1 and (not twin or ok_u * 3 >= len(twin) * 2)
-                       and not any(r.security for v in ctrl.values() for r in v) and crossed == len(hits))
+        twin_ok = not twin or ok_u * 3 >= len(twin) * 2
+        if att:
+            row["pass"] = (len(hits) >= 1 and twin_ok and crossed == len(hits)
+                           and not any(r.security for v in ctrl.values() for r in v))
+            row["status"] = "ok" if row["pass"] else "FAIL"
+        else:  # the attack case is not generated (seed file missing): only the twin can be judged
+            row["validated_undefended"], row["pass"] = "no attack case", False
+            row["status"] = "twin ok, attack missing" if twin_ok else "twin FAIL, attack missing"
         rows.append(row)
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -235,8 +241,10 @@ def cmd_b2_validate(a: argparse.Namespace) -> None:
         w.writerows(rows)
     for r in rows:
         print(f"{r['core_id']} {r['case_id']:<36} undefended {r['validated_undefended']:<4} twin {r['validated_twin']:<12} "
-              f"controls {r['validated_controls']:<10} path {r['path_check']:<4} {'ok' if r['pass'] else 'FAIL'}")
-    print(f"{sum(r['pass'] for r in rows)}/{len(rows)} core cases pass; table written to {out}")
+              f"controls {r['validated_controls']:<10} path {r['path_check']:<4} {r['status']}")
+    with_attack = [r for r in rows if r["validated_undefended"] != "no attack case"]
+    print(f"{sum(r['pass'] for r in rows)}/{len(with_attack)} core cases with an attack case pass "
+          f"({len(rows) - len(with_attack)} without one); table written to {out}")
 
 
 def main() -> None:
