@@ -10,6 +10,8 @@ dense adjacency matrices, so torch-geometric is not needed.
 """
 from __future__ import annotations
 
+import threading
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -55,16 +57,18 @@ def corrupt(x: torch.Tensor, anomalous: torch.Tensor) -> torch.Tensor:
 
 
 _EMBEDDER: dict[str, tuple] = {}
+_LOCK = threading.RLock()
 
 
 def embed(texts: list[str]) -> torch.Tensor:
     """Sentence embeddings of all-MiniLM-L6-v2 (mean pooling, normalized), via transformers."""
-    if EMBEDDER not in _EMBEDDER:
-        from transformers import AutoModel, AutoTokenizer
+    with _LOCK:  # loaded once; the model is used by one thread at a time
+        if EMBEDDER not in _EMBEDDER:
+            from transformers import AutoModel, AutoTokenizer
 
-        _EMBEDDER[EMBEDDER] = (AutoTokenizer.from_pretrained(EMBEDDER), AutoModel.from_pretrained(EMBEDDER).eval())
-    tok, model = _EMBEDDER[EMBEDDER]
-    with torch.no_grad():
+            _EMBEDDER[EMBEDDER] = (AutoTokenizer.from_pretrained(EMBEDDER), AutoModel.from_pretrained(EMBEDDER).eval())
+        tok, model = _EMBEDDER[EMBEDDER]
+    with _LOCK, torch.no_grad():
         batch = tok(texts, padding=True, truncation=True, max_length=256, return_tensors="pt")
         hidden = model(**batch).last_hidden_state
         mask = batch["attention_mask"].unsqueeze(-1).float()
