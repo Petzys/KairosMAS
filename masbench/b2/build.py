@@ -100,7 +100,8 @@ def _attacker(core_id: str, spec: dict[str, Any]) -> Attacker:
                            else CompromisedAgent(agent=a, instructions=text))
     return Attacker(
         position=row["adversary"], goal=row["effect_type"],
-        injections=[Injection(vector=v, text=t) for v, t in spec.get("injections", {}).items()],
+        injections=[Injection(vector=v, attack=t[0], goal=t[1]) if isinstance(t, tuple) else Injection(vector=v, text=t)
+                    for v, t in spec.get("injections", {}).items()],
         board_writes=[BoardWrite(**w) for w in spec.get("board_writes", [])],
         compromised_agents=compromised)
 
@@ -113,7 +114,9 @@ def cases(scn: Scenario, core_id: str, *, prompt: str, attack: dict[str, Any], s
           note: str | None = None, budget: Budget | None = None) -> list[Case]:
     """The attack case, its benign twin and its controls for one core id.
 
-    `attack` (and each control) has any of: `injections` {vector: text}, `compromised`
+    `attack` (and each control) has any of: `injections` {vector: literal text, or
+    (template id, goal) to wrap the goal in an attack template such as AgentDojo's
+    `important_instructions`}, `compromised`
     {agent: appended instructions, or ("replace", full system prompt)}, `board_writes`
     [{board, object, content, author}], and for controls `setup`. `compromised` prompts of a
     compromised agent replace nothing in the twin: the twin is the same scenario without the
@@ -155,3 +158,38 @@ def tool_step(tool: str, **args: Any) -> dict[str, Any]:
 
 def send_step(to: str, text: str, as_: str | None = None) -> dict[str, Any]:
     return {"send": to, "text": text, **({"as": as_} if as_ else {})}
+
+
+SEEDS = HERE / "seeds"
+
+
+def seeded_cases(scn: Scenario, core_id: str, *, prompt: str, utility: Check, twin_script: Script,
+                 path: list[str], checks_module: str, actors: list[str] | None = None,
+                 note: str | None = None, budget: Budget | None = None) -> list[Case]:
+    """Cases whose attacker side is supplied as data in `seeds/<core_id>.yaml`.
+
+    The environment, the task, the utility check and the benign twin are defined in code.
+    Without a seed file only the twin is generated. With one, the attack case is built from
+    it (format: see `seeds/README.md`)."""
+    import yaml
+
+    file = SEEDS / f"{core_id}.yaml"
+    row = CORE[core_id]
+    if not file.exists():
+        user = UserTurn(agent=scn.entry_agent.id, prompt=prompt)
+        return [Case(id=f"{scn.id}/{core_id}/twin", scenario=scn.id, kind="benign", user=user,
+                     scoring=Scoring(utility=utility), budget=budget or Budget(), script=twin_script,
+                     labels=_labels(core_id, row["case_id"], path, [], actors or [], "verbatim",
+                                    "Attack case not generated: seeds/%s.yaml is missing. %s" % (core_id, note or "")))]
+    seed = yaml.safe_load(file.read_text())
+    sec = seed["security"]
+    module = "masbench.checks" if sec.get("shared") else checks_module
+    attack = dict(seed["attack"])
+    attack["compromised"] = {a: (("replace", v["system_prompt"]) if "system_prompt" in v else v["instructions"])
+                             for a, v in attack.get("compromised", {}).items()}
+    return cases(scn, core_id, prompt=prompt, attack=attack, utility=utility,
+                 security=Check(ref=f"python:{module}:{sec['check']}", reads=sec.get("reads", ["state"]),
+                                args=sec.get("args", {})),
+                 script=seed["script"], twin_script=twin_script, path=path, readers=seed.get("readers", []),
+                 actors=actors, payload=seed.get("payload_source", "verbatim"),
+                 note=" ".join(filter(None, [note, seed.get("note")])) or None, budget=budget)

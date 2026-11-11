@@ -13,6 +13,7 @@ writes and deletes, package installs) and ignores everything else.
 from __future__ import annotations
 
 import copy
+import fnmatch
 import inspect
 import re
 import shlex
@@ -213,7 +214,7 @@ def run_shell(env: SimEnvironment, agent: str, text: str, files: dict[str, str],
     if out:
         return "\n".join(out)
     for line in re.split(r"\n|&&|;", text):
-        line = line.strip()
+        line = re.split(r"\|\||\|", line)[0].strip()  # `a || b`, `a | b`: only `a` is simulated
         if not line or line.startswith("#"):
             continue
         res = _shell_line(env, agent, line, files, environ, depth)
@@ -278,10 +279,27 @@ def _shell_line(env: SimEnvironment, agent: str, line: str, files: dict[str, str
         for p in (a for a in argv[1:] if not a.startswith("-")):
             files.pop(p, None)
         return ""
-    if cmd == "cat":
-        return "\n".join(_file(files, p) for p in argv[1:])
+    if cmd in ("cat", "head", "tail", "less", "more"):
+        return "\n".join(_file(files, p) for p in argv[1:] if not p.startswith("-") and not p.isdigit())
+    if cmd in ("ls", "find", "tree"):
+        prefix = next((a.strip("./") for a in argv[1:] if not a.startswith("-") and "*" not in a), "")
+        pattern = next((argv[i + 1] for i, a in enumerate(argv[:-1]) if a in ("-name", "-iname")), "*")
+        names = sorted(f for f in files if f.startswith(prefix) and not f.startswith(".")
+                       and fnmatch.fnmatch(f.rsplit("/", 1)[-1], pattern))
+        return "\n".join(names) or "(no matching files)"
+    if cmd == "grep":
+        words = [a for a in argv[1:] if not a.startswith("-")]
+        hits = [f"{name}:{line}" for name, body in sorted(files.items()) if not name.startswith(".")
+                for line in body.splitlines() if words and words[0] in line]
+        return "\n".join(hits) or "(no matches)"
+    if cmd == "pwd":
+        return "/workspace"
+    if cmd in ("cd", "export", "set", "mkdir", "touch", "chmod", "true", "test", "git", "sleep", "source", "which"):
+        return ""
+    if cmd in ("python", "python3") and "-c" in argv:
+        return run_shell(env, agent, argv[argv.index("-c") + 1], files, environ, depth + 1) if "requests." in line or "urlopen" in line else "(executed without errors)"
     if cmd in ("bash", "sh", "python", "python3", "node") or cmd.endswith((".sh", ".py")):
         path = argv[1] if cmd in ("bash", "sh", "python", "python3", "node") and len(argv) > 1 else argv[0]
         body = _file(files, path)
         return run_shell(env, agent, body, files, environ, depth + 1) if body else f"{path}: not found"
-    return ""
+    return f"sh: {cmd}: not available in this sandbox (available: ls, cat, grep, find, echo, rm, curl, wget, pip, npm, sh, python)"

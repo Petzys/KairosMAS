@@ -8,13 +8,14 @@ import sys
 import pytest
 
 from masbench import io
-from masbench.b2.build import CATALOG, CORE
+from masbench.b2.build import CATALOG, CORE, SEEDS
 from masbench.b2.generate import build_all
 from masbench.checks import path_crossed
 from masbench.env import make_environment
 from masbench.runner.run import RunConfig, run_batch
 
-# Core cases that are not implemented yet (their attacker prompts are still to be supplied).
+# Core cases whose attacker side is supplied as a seed file (masbench/b2/seeds/<core_id>.yaml).
+# Without the file only their benign twin exists.
 DEFERRED = {"B2-01", "B2-02", "B2-03", "B2-04", "B2-05", "B2-06", "B2-21", "B2-22", "B2-23", "B2-24",
             "B2-25", "B2-26", "B2-43", "B2-44", "B2-47"}
 BUILT = build_all()
@@ -32,9 +33,12 @@ def test_every_core_case_has_attack_twin_and_controls() -> None:
     by_core: dict[str, list] = {}
     for c in cases:
         by_core.setdefault(c.labels.core_id, []).append(c)
-    assert set(by_core) == set(CORE) - DEFERRED
+    assert set(by_core) == set(CORE)
     for core_id, cs in by_core.items():
         row = CORE[core_id]
+        if core_id in DEFERRED and not (SEEDS / f"{core_id}.yaml").exists():
+            assert [c.kind for c in cs] == ["benign"], core_id
+            continue
         assert sorted(c.kind for c in cs if c.kind != "control") == ["attack", "benign"], core_id
         assert {c.labels.case_id for c in cs if c.kind == "control"} == set(filter(None, row["controls"].split(";")))
         for c in cs:
@@ -81,7 +85,8 @@ def test_environment_reset_is_deterministic(sid: str) -> None:
 def test_simulated_b2_needs_neither_a_defense_nor_agentdojo() -> None:
     code = ("import sys, asyncio; from masbench import io; from masbench.runner.run import RunConfig, run_batch; "
             "s = io.load_scenario('b2.pipeline'); "
-            "asyncio.run(run_batch(s, io.load_cases(s.id), RunConfig(brain='replay'), None, progress=False)); "
+            "cases = [c for c in io.load_cases(s.id) if not (c.attacker and any(i.attack for i in c.attacker.injections))]; "
+            "asyncio.run(run_batch(s, cases, RunConfig(brain='replay'), None, progress=False)); "
             "bad = sorted(m for m in sys.modules if m.split('.')[0] in ('kairos', 'agentdojo') "
             "or m.startswith('masbench.defenses')); assert not bad, bad")
     subprocess.run([sys.executable, "-c", code], check=True)

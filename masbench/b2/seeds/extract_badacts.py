@@ -1,5 +1,10 @@
-"""Copy the prompts of the six BAD-ACTS core cases from a checkout of the seed repository
-into `badacts.json` (verbatim strings, read with `ast`; nothing from the checkout is run).
+"""Copy prompts from a checkout of the BAD-ACTS repository, verbatim (strings are read with
+`ast`; nothing from the checkout is run):
+
+* `badacts_agents.json`: the original system prompts and descriptions of the agents, used
+  by `masbench/b2/envs/teams.py` for the benign scenarios;
+* `badacts_adversarial.json`: the source's prompt templates for an adversarial agent, for
+  whoever writes the seed files of B2-01..06 (see README.md). Not used by any code.
 
     python -I masbench/b2/seeds/extract_badacts.py <path to JNoether/BAD-ACTS at 5ddfcfa>
 """
@@ -37,5 +42,9 @@ for path in sorted((repo / "environments").glob("*.py")):
         if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "AssistantAgent" and node.args:
             kw = {k.arg: fold(k.value) for k in node.keywords if k.arg in ("description", "system_message")}
             out["agents"][f"{path.stem}/{fold(node.args[0])}"] = kw
-Path(__file__).with_name("badacts.json").write_text(json.dumps(out, indent=1, ensure_ascii=False) + "\n")
-print({k: sorted(v) if isinstance(v, dict) else v for k, v in out.items()})
+here = Path(__file__).parent
+agents = {"commit": out["commit"], "agents": {k: v for k, v in out["agents"].items() if "Debate" not in k}}
+(here / "badacts_agents.json").write_text(json.dumps(agents, indent=1, ensure_ascii=False) + "\n")
+(here / "badacts_adversarial.json").write_text(
+    json.dumps({"commit": out["commit"], "templates": out["adversarial"]}, indent=1, ensure_ascii=False) + "\n")
+print(sorted(agents["agents"]), sorted(out["adversarial"]))
